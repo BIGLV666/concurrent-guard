@@ -5,6 +5,7 @@ import io.github.biglv666.guard.lock.LockAcquireFallbackHandler;
 import io.github.biglv666.guard.lock.LockAcquirePolicy;
 import io.github.biglv666.guard.lock.LockAcquireTimeoutException;
 import io.github.biglv666.guard.lock.LockTemplate;
+import io.github.biglv666.guard.lock.LockType;
 import org.junit.jupiter.api.Test;
 import org.redisson.Redisson;
 import org.redisson.api.RedissonClient;
@@ -28,6 +29,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -97,6 +99,12 @@ class LockIntegrationTest {
     }
 
     @Test
+    void localAnnotatedLockWorks() {
+        String key = "local-method-" + UUID.randomUUID();
+        assertEquals("local:" + key, service.local(key, 1));
+    }
+
+    @Test
     void businessExceptionReleasesLock() {
         String key = "e-" + UUID.randomUUID();
         assertThrows(IllegalStateException.class, () -> service.failing(key));
@@ -153,8 +161,29 @@ class LockIntegrationTest {
         assertNull(holderError.get());
     }
 
+    @Test
+    void localLockTemplateProtectsOnlyLambdaBlock() throws Exception {
+        String key = "local-" + UUID.randomUUID();
+        AtomicInteger count = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        pool.submit(() -> lockTemplate.withLocalLock(key, () -> {
+            int value = count.get();
+            try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            count.set(value + 1);
+            return null;
+        }));
+        pool.submit(() -> lockTemplate.withLocalLock(key, () -> {
+            int value = count.get();
+            count.set(value + 1);
+            return null;
+        }));
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+        assertEquals(2, count.get());
+    }
+
     /**
-     * 测试应用：注册连接容器的 RedissonClient。
+     * 测试应用：注册连接容器的 RedissonClient.
      */
     @SpringBootApplication
     static class App {
@@ -180,6 +209,13 @@ class LockIntegrationTest {
                     Thread.currentThread().interrupt();
                 }
                 return "ok:" + k;
+            }
+
+            @DistributedLock(key = "#k", type = LockType.SYNCHRONIZED, waitTime = 300,
+                    timeUnit = TimeUnit.MILLISECONDS)
+            public String local(String k, long millis) {
+                try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return "local:" + k;
             }
 
             @DistributedLock(key = "#k", waitTime = 300, timeUnit = TimeUnit.MILLISECONDS,
@@ -217,3 +253,4 @@ class LockIntegrationTest {
         }
     }
 }
+

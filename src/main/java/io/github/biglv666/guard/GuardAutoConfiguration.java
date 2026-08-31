@@ -6,6 +6,7 @@ import io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
 import io.github.biglv666.guard.lock.LockAspect;
 import io.github.biglv666.guard.lock.LockTemplate;
+import io.github.biglv666.guard.lock.LocalLockManager;
 import io.github.biglv666.guard.metrics.GuardMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RedissonClient;
@@ -32,8 +33,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  *   <li>幂等模块：classpath 存在 Spring Data Redis 且 {@code guard.idempotent.enabled=true}
  *       时装配；默认策略 {@link RedisSetNxIdempotentPolicy} 可被用户注册的
  *       {@link IdempotentPolicy} Bean 覆盖；</li>
- *   <li>锁模块：classpath 存在 Redisson 且 {@code guard.lock.enabled=true} 时装配；
- *       容器中缺少 {@link RedissonClient} 时不崩溃，首次加锁时抛出清晰配置错误。</li>
+ *   <li>锁模块：{@code guard.lock.enabled=true} 时装配，支持 Redis 锁与 JVM 本地锁；
+ *       容器中缺少 {@link RedissonClient} 不影响本地锁，只有实际使用 Redis 锁时才抛出清晰配置错误。</li>
  * </ul>
  *
  * @author Guard Team
@@ -92,11 +93,17 @@ public class GuardAutoConfiguration {
     }
 
     /**
-     * 分布式锁模块装配：仅当 classpath 存在 Redisson 时生效。
+     * 锁模块装配：本地锁不依赖 Redisson，Redis 客户端在实际使用 Redis 锁时懒获取。
      */
     @ConditionalOnClass(RedissonClient.class)
     @ConditionalOnProperty(prefix = "guard.lock", name = "enabled", havingValue = "true", matchIfMissing = true)
     static class LockConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        public LocalLockManager localLockManager() {
+            return new LocalLockManager();
+        }
 
         @Bean
         public LockAspect lockAspect(ObjectProvider<RedissonClient> redissonProvider,
@@ -104,15 +111,21 @@ public class GuardAutoConfiguration {
                                      SpelKeyResolver keyResolver,
                                      GuardProperties guardProperties,
                                      GuardMetrics guardMetrics,
-                                     ApplicationEventPublisher eventPublisher) {
+                                     ApplicationEventPublisher eventPublisher,
+                                     LocalLockManager localLockManager) {
             return new LockAspect(redissonProvider, applicationContextProvider, keyResolver,
-                    guardProperties.getLock(), guardMetrics, eventPublisher);
+                    guardProperties.getLock(), guardMetrics, eventPublisher, localLockManager);
         }
 
         @Bean
         public LockTemplate lockTemplate(ObjectProvider<RedissonClient> redissonProvider,
-                                         GuardProperties guardProperties) {
-            return new LockTemplate(redissonProvider, guardProperties.getLock());
+                                         GuardProperties guardProperties,
+                                         LocalLockManager localLockManager) {
+            return new LockTemplate(redissonProvider, guardProperties.getLock(), localLockManager);
         }
     }
 }
+
+
+
+

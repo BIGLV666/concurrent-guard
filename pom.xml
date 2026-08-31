@@ -63,7 +63,7 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- 分布式锁基于 Redisson（看门狗续期）；未引入 Redisson 时锁功能不装配 -->
+        <!-- Redis 锁按实际调用懒加载 Redisson；本地锁不依赖 Redisson -->
         <dependency>
             <groupId>org.redisson</groupId>
             <artifactId>redisson</artifactId>

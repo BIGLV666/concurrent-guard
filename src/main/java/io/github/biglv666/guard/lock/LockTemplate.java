@@ -11,15 +11,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * 分布式锁的程序化 API —— 与切面共享同一套锁语义，覆盖不适合打注解的细粒度场景：
+ * 程序化代码块加锁模板。
  *
- * <pre>
- * String result = lockTemplate.withLock("stock:1001", () -> doDeductStock());
- * </pre>
+ * <p>{@link #withLock(String, Supplier)} 使用 Redis 分布式锁；
+ * {@link #withLocalLock(String, Supplier)} 使用当前 JVM 内的本地锁。
+ * 两者都只保护 Lambda 执行期间的代码，适合细粒度锁定局部业务逻辑。</p>
  *
- * <p>与注解方式的差异：此处 key 直接传入业务键（自动拼配置前缀），
- * 获取锁失败统一抛 {@link LockAcquireTimeoutException}，由调用方自行决定降级方式。
- * 释放同样在 finally 中以 {@code isHeldByCurrentThread()} 保护。
+ * <p>Redis 客户端不会在模板实例化时校验，而是在首次调用 Redis 方法时懒获取。
+ * 本地锁不依赖 Redisson，且本地锁的租期参数不适用。</p>
  *
  * @author Guard Team
  * @since 0.1.0
@@ -35,11 +34,20 @@ public class LockTemplate {
 
     private final ObjectProvider<RedissonClient> redissonProvider;
     private final GuardProperties.Lock properties;
+    private final LocalLockManager localLockManager;
 
+    /** 兼容旧版直接实例化方式。 */
     public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                         GuardProperties.Lock properties) {
+        this(redissonProvider, properties, new LocalLockManager());
+    }
+
+    public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
+                        GuardProperties.Lock properties,
+                        LocalLockManager localLockManager) {
         this.redissonProvider = redissonProvider;
         this.properties = properties;
+        this.localLockManager = localLockManager;
     }
 
     /**
@@ -67,6 +75,34 @@ public class LockTemplate {
             action.run();
             return null;
         });
+    }
+
+    /** 使用 JVM 本地锁保护局部代码块，锁范围仅限 Lambda 执行期间。 */
+    public <T> T withLocalLock(String key, Supplier<T> action) {
+        return withLocalLock(key, DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS, action);
+    }
+
+    /** 使用 JVM 本地锁保护无返回值代码块。 */
+    public void withLocalLock(String key, Runnable action) {
+        withLocalLock(key, DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS, () -> { action.run(); return null; });
+    }
+
+    /** 使用指定等待时间的 JVM 本地锁保护代码块；本地锁不使用 leaseTime。 */
+    public <T> T withLocalLock(String key, long waitTime, TimeUnit unit, Supplier<T> action) {
+        String fullKey = properties.getKeyPrefix() + key;
+        LocalLockManager.Handle handle = localLockManager.acquire(fullKey);
+        boolean locked = false;
+        try {
+            locked = handle.lock().tryLock(waitTime, unit);
+            if (!locked) throw timeout(fullKey, waitTime, unit);
+            return action.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw timeout(fullKey, waitTime, unit);
+        } finally {
+            if (locked) handle.lock().unlock();
+            handle.close();
+        }
     }
 
     /**

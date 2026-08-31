@@ -21,21 +21,15 @@ import org.springframework.context.ApplicationEventPublisher;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 分布式锁切面 —— {@code @DistributedLock} 的核心实现。
+ * {@link DistributedLock} 的方法级切面。
  *
- * <p>执行流程：
- * <ol>
- *   <li>解析锁键（SpEL 或方法级默认键），拼接配置前缀；</li>
- *   <li>{@code tryLock(waitTime, leaseTime)} 获取 Redisson 锁；
- *       等待超时按注解策略 THROW / SKIP / CUSTOM 处理，并发布事件、累加指标；</li>
- *   <li>业务方法在 finally 中释放锁：先 {@code isHeldByCurrentThread()} 校验，
- *       避免等待超时后误释放其他持有者的锁。</li>
- * </ol>
+ * <p>根据注解的 {@link LockType} 选择 Redisson 分布式锁或当前 JVM 内的本地锁。
+ * 本地锁不要求容器中存在 {@link RedissonClient}；Redis 客户端仅在实际执行 Redis 路径时懒获取。</p>
  *
- * <p>容器中不存在 {@link RedissonClient} 时不在启动期崩溃，
- * 而是在首次执行加锁方法时抛出清晰的配置错误。
+ * <p>锁获取失败统一按 THROW、SKIP、CUSTOM 策略处理，并在 finally 中安全释放已获取的锁。</p>
  *
  * @author Guard Team
  * @since 0.1.0
@@ -51,6 +45,7 @@ public class LockAspect {
     private final GuardProperties.Lock properties;
     private final GuardMetrics metrics;
     private final ApplicationEventPublisher eventPublisher;
+    private final LocalLockManager localLockManager;
 
     /**
      * 自定义回退处理器的解析缓存：类型 -> 实例（优先容器 Bean，其次无参构造实例化）。
@@ -58,18 +53,31 @@ public class LockAspect {
     private final Map<Class<? extends LockAcquireFallbackHandler>, LockAcquireFallbackHandler> handlerCache =
             new ConcurrentHashMap<>();
 
+    /** 兼容旧版直接实例化方式。 */
     public LockAspect(ObjectProvider<RedissonClient> redissonProvider,
                       ObjectProvider<ApplicationContext> applicationContextProvider,
                       SpelKeyResolver keyResolver,
                       GuardProperties.Lock properties,
                       GuardMetrics metrics,
                       ApplicationEventPublisher eventPublisher) {
+        this(redissonProvider, applicationContextProvider, keyResolver, properties, metrics,
+                eventPublisher, new LocalLockManager());
+    }
+
+    public LockAspect(ObjectProvider<RedissonClient> redissonProvider,
+                      ObjectProvider<ApplicationContext> applicationContextProvider,
+                      SpelKeyResolver keyResolver,
+                      GuardProperties.Lock properties,
+                      GuardMetrics metrics,
+                      ApplicationEventPublisher eventPublisher,
+                      LocalLockManager localLockManager) {
         this.redissonProvider = redissonProvider;
         this.applicationContextProvider = applicationContextProvider;
         this.keyResolver = keyResolver;
         this.properties = properties;
         this.metrics = metrics;
         this.eventPublisher = eventPublisher;
+        this.localLockManager = localLockManager;
     }
 
     /**
@@ -85,37 +93,46 @@ public class LockAspect {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         String spelKey = keyResolver.resolve(method, pjp.getArgs(), distributedLock.key());
         String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method);
-
-        RLock lock = requireClient().getLock(key);
+        LocalLockManager.Handle localHandle = null;
+        RLock redisLock = null;
         boolean locked = false;
         try {
-            // leaseTime = -1 时 Redisson 启用看门狗自动续期
-            locked = lock.tryLock(distributedLock.waitTime(), distributedLock.leaseTime(),
-                    distributedLock.timeUnit());
-        } catch (InterruptedException e) {
-            // 等待期间被中断：恢复中断标记，按未获取到锁处理
-            Thread.currentThread().interrupt();
-            log.warn("锁等待被中断 - key: {}, method: {}", key, method.getName());
-        }
-
-        if (!locked) {
-            metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
-            publish(key, method);
-            return handleTimeout(pjp, distributedLock, key, method);
-        }
-
-        try {
+            if (distributedLock.type() == LockType.SYNCHRONIZED) {
+                localHandle = localLockManager.acquire(key);
+                try {
+                    locked = localHandle.lock().tryLock(distributedLock.waitTime(), distributedLock.timeUnit());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("本地锁等待被中断 - key: {}, method: {}", key, method.getName());
+                }
+            } else {
+                redisLock = requireClient().getLock(key);
+                try {
+                    locked = redisLock.tryLock(distributedLock.waitTime(), distributedLock.leaseTime(), distributedLock.timeUnit());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Redis 锁等待被中断 - key: {}, method: {}", key, method.getName());
+                }
+            }
+            if (!locked) {
+                metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
+                publish(key, method);
+                return handleTimeout(pjp, distributedLock, key, method);
+            }
             return pjp.proceed();
         } finally {
-            // isHeldByCurrentThread 校验：tryLock 失败/中断路径不会走进此分支，
-            // 且防止租期恰好过期后 unlock 抛出 IllegalMonitorStateException
-            try {
-                if (lock.isHeldByCurrentThread()) {
-                    lock.unlock();
+            if (locked) {
+                if (distributedLock.type() == LockType.SYNCHRONIZED) {
+                    localHandle.lock().unlock();
+                } else if (redisLock != null) {
+                    try {
+                        if (redisLock.isHeldByCurrentThread()) redisLock.unlock();
+                    } catch (IllegalMonitorStateException e) {
+                        log.warn("锁释放异常（租期可能已过期被自动释放）- key: {}, method: {}", key, method.getName(), e);
+                    }
                 }
-            } catch (IllegalMonitorStateException e) {
-                log.warn("锁释放异常（租期可能已过期被自动释放）- key: {}, method: {}", key, method.getName(), e);
             }
+            if (localHandle != null) localHandle.close();
         }
     }
 
