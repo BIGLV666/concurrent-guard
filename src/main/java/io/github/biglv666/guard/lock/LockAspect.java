@@ -96,6 +96,7 @@ public class LockAspect {
         LocalLockManager.Handle localHandle = null;
         RLock redisLock = null;
         boolean locked = false;
+        long acquireStart = System.nanoTime();
         try {
             if (distributedLock.type() == LockType.SYNCHRONIZED) {
                 localHandle = localLockManager.acquire(key);
@@ -119,6 +120,8 @@ public class LockAspect {
                 publish(key, method);
                 return handleTimeout(pjp, distributedLock, key, method);
             }
+            // 成功获取（含等待时间）计入锁耗时分布；超时失败已计入拒绝指标，不重复记录
+            metrics.recordLockAcquire(distributedLock.type().name(), System.nanoTime() - acquireStart);
             return pjp.proceed();
         } finally {
             if (locked) {

@@ -53,9 +53,24 @@ class SpelKeyResolverTest {
     }
 
     @Test
-    void unknownVariableEvaluatesToNull() throws NoSuchMethodException {
-        // 求值为 null 时返回 null，调用方回退方法级默认键
-        assertNull(resolver.resolve(method("order", String.class), new Object[]{"42"}, "#missing"));
+    void nullEvaluationResultFailsFast() throws NoSuchMethodException {
+        // 表达式已声明但引用了不存在的变量：求值为 null，快速失败而非回退方法级默认键
+        assertThrows(SpelKeyResolver.KeyResolveException.class,
+                () -> resolver.resolve(method("order", String.class), new Object[]{"42"}, "#missing"));
+    }
+
+    @Test
+    void nullPropertyValueFailsFast() throws NoSuchMethodException {
+        // 入参对象属性为 null：同样快速失败，提示数据或配置错误
+        assertThrows(SpelKeyResolver.KeyResolveException.class,
+                () -> resolver.resolve(method("order", String.class), new Object[]{null}, "#orderId"));
+    }
+
+    @Test
+    void blankEvaluationResultFailsFast() throws NoSuchMethodException {
+        // 求值为空白字符串：拼接后所有请求共享同一 key，防护粒度意外变粗，同样快速失败
+        assertThrows(SpelKeyResolver.KeyResolveException.class,
+                () -> resolver.resolve(method("order", String.class), new Object[]{"  "}, "#orderId"));
     }
 
     @Test

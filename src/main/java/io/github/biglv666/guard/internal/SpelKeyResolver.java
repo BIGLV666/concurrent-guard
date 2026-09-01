@@ -50,8 +50,10 @@ public class SpelKeyResolver {
      * @param method        被拦截的方法
      * @param args          方法实际入参（与方法参数名按位置对应）
      * @param keyExpression 注解声明的 key 表达式；允许为 null 或空白，表示方法级默认键
-     * @return 解析出的 key 值；keyExpression 为空白时返回 null
-     * @throws KeyResolveException 表达式编译或求值失败时抛出（快速失败，不静默回退）
+     * @return 解析出的 key 值；keyExpression 为空白（未声明表达式）时返回 null
+     * @throws KeyResolveException 表达式编译或求值失败时抛出（快速失败，不静默回退）；
+     *                             表达式已声明但求值结果为 null 或空白时同样抛出，
+     *                             避免 key 意外回退到方法级默认键导致防护粒度变粗
      */
     public String resolve(Method method, Object[] args, String keyExpression) {
         if (keyExpression == null || keyExpression.isBlank()) {
@@ -68,7 +70,16 @@ public class SpelKeyResolver {
                 }
             }
             Object value = expression.getValue(context);
-            return value == null ? null : String.valueOf(value);
+            // 声明了表达式却求值出 null/空白（如入参业务 id 为 null）：属于数据或配置错误。
+            // 若静默回退方法级默认键，会把"按业务 id 隔离"意外放大为"整个方法互斥"，造成无关请求被误拒，故快速失败。
+            String resolved = value == null ? null : String.valueOf(value);
+            if (resolved == null || resolved.isBlank()) {
+                throw new KeyResolveException("key 表达式求值结果为空（null 或空白），已拒绝静默回退方法级默认键"
+                        + " - method: " + method.getName() + ", key: '" + keyExpression + "'", null);
+            }
+            return resolved;
+        } catch (KeyResolveException e) {
+            throw e;
         } catch (Exception e) {
             throw new KeyResolveException("key 表达式求值失败 - method: " + method.getName()
                     + ", key: '" + keyExpression + "'", e);

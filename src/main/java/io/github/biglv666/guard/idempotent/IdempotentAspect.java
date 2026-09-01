@@ -25,8 +25,11 @@ import java.time.Duration;
  *   <li>解析 key（SpEL 或方法级默认键），拼接配置前缀；</li>
  *   <li>通过 {@link IdempotentPolicy} 尝试占位：占位失败抛 {@link IdempotentRejectedException}；
  *       策略故障按 fail-open（放行不占位）/ fail-close（拒绝）降级；</li>
- *   <li>占位成功后执行业务：正常返回则占位保留至 TTL；业务异常时按
- *       {@code rollbackOnException} 决定是否释放占位（释放失败仅记日志，不吞原异常）。</li>
+ *   <li>REPLAY 模式下占位失败时先尝试结果重放：窗口内业务已完成的同 key 请求
+ *       直接返回首次结果，仍在处理中或结果不可用时退回拒绝；</li>
+ *   <li>占位成功后执行业务：正常返回则占位保留至 TTL（REPLAY 模式下同时保存序列化结果）；
+ *       业务异常时按 {@code rollbackOnException} 决定是否释放占位
+ *       （释放失败仅记日志，不吞原异常）。</li>
  * </ol>
  *
  * <p>拒绝与降级拒绝都会发布 {@link GuardRejectedEvent} 并累加 Micrometer 指标。
@@ -39,18 +42,27 @@ public class IdempotentAspect {
 
     private static final Logger log = LoggerFactory.getLogger(IdempotentAspect.class);
 
+    /**
+     * tryReplay 的哨兵返回值：表示"无可重放结果"（仍在处理中 / 查询或反序列化失败），
+     * 与"重放结果本身为 null"（void 方法）区分。
+     */
+    private static final Object REPLAY_NONE = new Object();
+
     private final IdempotentPolicyProvider policyProvider;
+    private final ResultCodecProvider codecProvider;
     private final SpelKeyResolver keyResolver;
     private final GuardProperties.Idempotent properties;
     private final GuardMetrics metrics;
     private final ApplicationEventPublisher eventPublisher;
 
     public IdempotentAspect(IdempotentPolicyProvider policyProvider,
+                            ResultCodecProvider codecProvider,
                             SpelKeyResolver keyResolver,
                             GuardProperties.Idempotent properties,
                             GuardMetrics metrics,
                             ApplicationEventPublisher eventPublisher) {
         this.policyProvider = policyProvider;
+        this.codecProvider = codecProvider;
         this.keyResolver = keyResolver;
         this.properties = properties;
         this.metrics = metrics;
@@ -71,6 +83,12 @@ public class IdempotentAspect {
         String spelKey = keyResolver.resolve(method, pjp.getArgs(), idempotent.key());
         String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method);
         Duration ttl = Duration.ofMillis(idempotent.timeUnit().toMillis(idempotent.ttl()));
+        IdempotentMode mode = idempotent.mode();
+
+        if (mode == IdempotentMode.REPLAY) {
+            // 配置错误在占位前快速失败，避免先占用键再暴露问题
+            requireReplaySupport();
+        }
 
         boolean acquired;
         try {
@@ -86,17 +104,114 @@ public class IdempotentAspect {
         }
 
         if (!acquired) {
+            if (mode == IdempotentMode.REPLAY) {
+                Object replayed = tryReplay(key, method);
+                if (replayed != REPLAY_NONE) {
+                    return replayed;
+                }
+            }
             reject(key, method, idempotent.message());
         }
 
         try {
-            return pjp.proceed();
+            Object result = pjp.proceed();
+            if (mode == IdempotentMode.REPLAY) {
+                saveResultQuietly(key, result, ttl);
+            }
+            return result;
         } catch (Throwable businessError) {
             if (idempotent.rollbackOnException()) {
                 releaseQuietly(key, businessError);
             }
             throw businessError;
         }
+    }
+
+    /**
+     * REPLAY 模式的重复请求处理：尝试加载并反序列化首次结果。
+     *
+     * <p>结果查询或反序列化故障按一致性优先处理（拒绝请求并发布降级事件），
+     * 避免在无法确认结果的情况下放行导致业务重复执行。
+     *
+     * @return 重放的返回值；无可重放结果时返回 {@link #REPLAY_NONE} 哨兵
+     */
+    private Object tryReplay(String key, Method method) {
+        String payload;
+        try {
+            payload = requirePolicy().loadResult(key);
+        } catch (Exception e) {
+            log.warn("幂等结果重放查询故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
+                    key, method.getName(), e.getMessage());
+            publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "结果重放查询故障，fail-close: " + e.getMessage());
+            metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+            return REPLAY_NONE;
+        }
+        if (payload == null) {
+            // 首个请求仍在处理中（占位值还是处理中标记），无结果可重放
+            return REPLAY_NONE;
+        }
+        try {
+            Object replayed = requireCodec().deserialize(payload, method.getGenericReturnType());
+            metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
+            return replayed;
+        } catch (Exception e) {
+            log.warn("幂等重放结果反序列化失败，拒绝本次请求 - key: {}, method: {}, 错误: {}",
+                    key, method.getName(), e.getMessage());
+            publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "重放结果反序列化失败: " + e.getMessage());
+            metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+            return REPLAY_NONE;
+        }
+    }
+
+    /**
+     * 保存业务结果供重复请求重放。保存失败仅记 warn：
+     * 占位键保持"处理中"标记，窗口内重复请求退回拒绝行为，不影响业务返回值。
+     */
+    private void saveResultQuietly(String key, Object result, Duration ttl) {
+        try {
+            requirePolicy().saveResult(key, requireCodec().serialize(result), ttl);
+        } catch (Exception e) {
+            log.warn("幂等结果保存失败，窗口内重复请求将退回拒绝行为 - key: {}, 错误: {}", key, e.getMessage());
+        }
+    }
+
+    /**
+     * REPLAY 模式的前置校验：策略不支持重放、或容器中没有 ResultCodec 时，
+     * 在占位前抛出清晰的配置错误（而非静默降级为拒绝模式）。
+     */
+    private void requireReplaySupport() {
+        IdempotentPolicy policy = requirePolicy();
+        if (!policy.supportsReplay()) {
+            throw new IllegalStateException(
+                    "@Idempotent(mode = REPLAY) 要求 IdempotentPolicy 支持结果重放，"
+                            + "但当前策略 " + policy.getClass().getName() + " 的 supportsReplay() 返回 false。"
+                            + "请实现 saveResult/loadResult 并覆写 supportsReplay()，或改用默认的"
+                            + " RedisSetNxIdempotentPolicy / mode = REJECT。");
+        }
+        requireCodec();
+    }
+
+    /**
+     * 懒获取结果编解码器：REPLAY 模式下容器中没有 ResultCodec 时抛出清晰的配置错误。
+     */
+    private ResultCodec requireCodec() {
+        ResultCodec codec = codecProvider.getIfAvailable();
+        if (codec == null) {
+            throw new IllegalStateException(
+                    "@Idempotent(mode = REPLAY) 需要容器中存在 ResultCodec Bean 用于结果序列化。"
+                            + "请引入 Jackson 依赖（自动装配默认的 JacksonResultCodec），或注册自定义 ResultCodec。");
+        }
+        return codec;
+    }
+
+    /**
+     * 结果编解码器的延迟解析入口，隔离 ObjectProvider 使切面便于单测。
+     *
+     * @since 0.2.0
+     */
+    @FunctionalInterface
+    public interface ResultCodecProvider {
+        ResultCodec getIfAvailable();
     }
 
     /**

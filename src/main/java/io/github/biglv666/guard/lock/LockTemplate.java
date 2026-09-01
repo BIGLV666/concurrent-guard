@@ -1,6 +1,7 @@
 package io.github.biglv666.guard.lock;
 
 import io.github.biglv666.guard.GuardProperties;
+import io.github.biglv666.guard.metrics.GuardMetrics;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
@@ -35,19 +36,30 @@ public class LockTemplate {
     private final ObjectProvider<RedissonClient> redissonProvider;
     private final GuardProperties.Lock properties;
     private final LocalLockManager localLockManager;
+    /** 可选：宿主无 Micrometer 时为 null，锁耗时上报为空操作。 */
+    private final GuardMetrics metrics;
 
     /** 兼容旧版直接实例化方式。 */
     public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                         GuardProperties.Lock properties) {
-        this(redissonProvider, properties, new LocalLockManager());
+        this(redissonProvider, properties, new LocalLockManager(), null);
+    }
+
+    /** 兼容 0.1.0 直接实例化方式（无指标上报）。 */
+    public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
+                        GuardProperties.Lock properties,
+                        LocalLockManager localLockManager) {
+        this(redissonProvider, properties, localLockManager, null);
     }
 
     public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                         GuardProperties.Lock properties,
-                        LocalLockManager localLockManager) {
+                        LocalLockManager localLockManager,
+                        GuardMetrics metrics) {
         this.redissonProvider = redissonProvider;
         this.properties = properties;
         this.localLockManager = localLockManager;
+        this.metrics = metrics;
     }
 
     /**
@@ -92,9 +104,11 @@ public class LockTemplate {
         String fullKey = properties.getKeyPrefix() + key;
         LocalLockManager.Handle handle = localLockManager.acquire(fullKey);
         boolean locked = false;
+        long acquireStart = System.nanoTime();
         try {
             locked = handle.lock().tryLock(waitTime, unit);
             if (!locked) throw timeout(fullKey, waitTime, unit);
+            recordAcquire(LockType.SYNCHRONIZED, acquireStart);
             return action.get();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -121,6 +135,7 @@ public class LockTemplate {
         String fullKey = String.format("%s%s", properties.getKeyPrefix(), key);
         RLock lock = requireClient().getLock(fullKey);
         boolean locked = false;
+        long acquireStart = System.nanoTime();
         try {
             locked = lock.tryLock(waitTime, leaseTime, unit);
         } catch (InterruptedException e) {
@@ -130,6 +145,7 @@ public class LockTemplate {
         if (!locked) {
             throw timeout(fullKey, waitTime, unit);
         }
+        recordAcquire(LockType.REDIS, acquireStart);
         try {
             return action.get();
         } finally {
@@ -140,6 +156,15 @@ public class LockTemplate {
             } catch (IllegalMonitorStateException e) {
                 log.warn("锁释放异常（租期可能已过期被自动释放）- key: {}", fullKey, e);
             }
+        }
+    }
+
+    /**
+     * 上报一次成功获取锁的耗时（含等待时间）；超时失败不计入耗时分布。
+     */
+    private void recordAcquire(LockType lockType, long acquireStart) {
+        if (metrics != null) {
+            metrics.recordLockAcquire(lockType.name(), System.nanoTime() - acquireStart);
         }
     }
 

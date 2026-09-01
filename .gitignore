@@ -7,3 +7,6 @@ target/
 .vscode/
 *.log
 .DS_Store
+
+# 本地安全扫描工具产物
+.mimosa/

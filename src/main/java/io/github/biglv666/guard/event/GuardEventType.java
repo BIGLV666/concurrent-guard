@@ -21,6 +21,14 @@ public enum GuardEventType {
     IDEMPOTENT_DEGRADED,
 
     /**
+     * 幂等重放：REPLAY 模式下重复请求直接返回了首次的处理结果。
+     * 仅计入指标（{@code guard_replayed_total}），不发布拒绝事件——重放不是拒绝。
+     *
+     * @since 0.2.0
+     */
+    IDEMPOTENT_REPLAYED,
+
+    /**
      * 锁等待超时：获取分布式锁在 waitTime 内未成功，按注解策略处理。
      */
     LOCK_TIMEOUT

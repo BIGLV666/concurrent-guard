@@ -64,4 +64,12 @@ public @interface Idempotent {
      * 重复请求被拒绝时，{@link IdempotentRejectedException} 携带的提示信息。
      */
     String message() default "请求处理中，请勿重复提交";
+
+    /**
+     * 幂等模式：
+     * {@link IdempotentMode#REJECT}（默认）= 重复请求直接拒绝；
+     * {@link IdempotentMode#REPLAY} = 业务正常完成后，窗口内的重复请求重放首次的返回值
+     * （首次仍在处理中时仍拒绝；异常回滚行为不变）。
+     */
+    IdempotentMode mode() default IdempotentMode.REJECT;
 }

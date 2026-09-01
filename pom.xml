@@ -12,9 +12,9 @@
 
     <groupId>io.github.biglv666</groupId>
     <artifactId>guard-spring-boot-starter</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <name>Guard Spring Boot Starter</name>
-    <description>轻量级并发防护 Spring Boot Starter：注解式幂等（防重复提交，支持异常回滚与自定义策略）与注解式分布式锁（Redisson）。</description>
+    <description>轻量级并发防护 Spring Boot Starter：注解式幂等（防重复提交，支持异常回滚、结果重放与自定义策略）与注解式分布式锁（Redisson）。</description>
     <url>https://github.com/BIGLV666/concurrent-guard</url>
 
     <licenses>
@@ -75,6 +75,20 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 幂等结果重放的默认编解码器：宿主有 Jackson 时自动装配，可被自定义 ResultCodec 覆盖 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 生成 guard.* 配置项的 IDE 提示元数据（META-INF/spring-configuration-metadata.json），不参与运行时 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
             <optional>true</optional>
         </dependency>
 

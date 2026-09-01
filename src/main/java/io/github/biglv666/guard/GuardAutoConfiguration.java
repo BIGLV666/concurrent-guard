@@ -2,12 +2,15 @@ package io.github.biglv666.guard;
 
 import io.github.biglv666.guard.idempotent.IdempotentAspect;
 import io.github.biglv666.guard.idempotent.IdempotentPolicy;
+import io.github.biglv666.guard.idempotent.JacksonResultCodec;
 import io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy;
+import io.github.biglv666.guard.idempotent.ResultCodec;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
 import io.github.biglv666.guard.lock.LockAspect;
 import io.github.biglv666.guard.lock.LockTemplate;
 import io.github.biglv666.guard.lock.LocalLockManager;
 import io.github.biglv666.guard.metrics.GuardMetrics;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.ObjectProvider;
@@ -83,12 +86,27 @@ public class GuardAutoConfiguration {
 
         @Bean
         public IdempotentAspect idempotentAspect(ObjectProvider<IdempotentPolicy> policyProvider,
+                                                 ObjectProvider<ResultCodec> codecProvider,
                                                  SpelKeyResolver keyResolver,
                                                  GuardProperties guardProperties,
                                                  GuardMetrics guardMetrics,
                                                  ApplicationEventPublisher eventPublisher) {
-            return new IdempotentAspect(policyProvider::getIfAvailable, keyResolver,
-                    guardProperties.getIdempotent(), guardMetrics, eventPublisher);
+            return new IdempotentAspect(policyProvider::getIfAvailable, codecProvider::getIfAvailable,
+                    keyResolver, guardProperties.getIdempotent(), guardMetrics, eventPublisher);
+        }
+    }
+
+    /**
+     * 结果编解码器装配：仅当 classpath 存在 Jackson 时生效。
+     * 业务方注册自定义 ResultCodec Bean 时此处不装配。
+     */
+    @ConditionalOnClass(ObjectMapper.class)
+    static class ResultCodecConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean(ResultCodec.class)
+        public ResultCodec resultCodec() {
+            return new JacksonResultCodec();
         }
     }
 
@@ -120,8 +138,9 @@ public class GuardAutoConfiguration {
         @Bean
         public LockTemplate lockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                                          GuardProperties guardProperties,
-                                         LocalLockManager localLockManager) {
-            return new LockTemplate(redissonProvider, guardProperties.getLock(), localLockManager);
+                                         LocalLockManager localLockManager,
+                                         GuardMetrics guardMetrics) {
+            return new LockTemplate(redissonProvider, guardProperties.getLock(), localLockManager, guardMetrics);
         }
     }
 }
