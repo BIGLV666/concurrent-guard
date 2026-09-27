@@ -1,5 +1,7 @@
 # Guard Spring Boot Starter
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.biglv666/guard-spring-boot-starter)](https://central.sonatype.com/artifact/io.github.biglv666/guard-spring-boot-starter) [![CI](https://github.com/BIGLV666/concurrent-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/BIGLV666/concurrent-guard/actions/workflows/ci.yml)
+
 轻量级并发防护 Spring Boot Starter：**注解式幂等（防重复提交）** 与 **注解式分布式锁**。
 与 [api-governance](../api-governance-spring-boot-starte)（流量治理）、[OutboxPro](../OutboxPro)（消息可靠性）定位互补。
 
