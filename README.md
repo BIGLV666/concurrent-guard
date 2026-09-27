@@ -3,14 +3,14 @@
 [![Maven Central](https://img.shields.io/maven-central/v/io.github.biglv666/guard-spring-boot-starter)](https://central.sonatype.com/artifact/io.github.biglv666/guard-spring-boot-starter) [![CI](https://github.com/BIGLV666/concurrent-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/BIGLV666/concurrent-guard/actions/workflows/ci.yml)
 
 轻量级并发防护 Spring Boot Starter：**注解式幂等（防重复提交）** 与 **注解式分布式锁**。
-与 [api-governance](../api-governance-spring-boot-starte)（流量治理）、[OutboxPro](../OutboxPro)（消息可靠性）定位互补。
+与 [api-governance](../api-governance-spring-boot-starter)（流量治理）、[OutboxPro](../OutboxPro)（消息可靠性）定位互补。
 
 ## 特性
 
 - **幂等** `@Idempotent`：Redis setnx + TTL 原子占位；业务异常默认回滚占位（允许重试）；支持 REPLAY 模式在 TTL 窗口内重放首次结果；支持自定义 `IdempotentPolicy` 策略
 - **锁** `@DistributedLock`：支持 `REDIS` 分布式锁与 `SYNCHRONIZED` JVM 本地锁；锁粒度由 SpEL key 决定；THROW / SKIP / CUSTOM 三种获取失败策略；另有支持 Lambda 代码块的程序化 `LockTemplate`
 - **事件 SPI**：幂等拒绝、锁超时统一发布 `GuardRejectedEvent`（Spring ApplicationEvent），业务方订阅后自由接告警
-- **指标**：宿主有 Micrometer 时自动上报拒绝计数 `guard_rejected_total`、重放计数 `guard_replayed_total` 与锁获取耗时 `guard_lock_acquire`
+- **指标**：宿主有 Micrometer 时自动上报拒绝计数 `guard_rejected_total`、降级计数 `guard_degraded_total`、重放计数 `guard_replayed_total` 与锁获取耗时 `guard_lock_acquire`
 - **快速失败**：key 的 SpEL 配置错误在首次调用即抛清晰异常，不静默回退
 
 ## 快速开始
@@ -49,6 +49,10 @@ public Result submit(@RequestBody Order order) { ... }
 REPLAY 模式行为：首个请求正常返回后，返回值被序列化保存（默认 Jackson，可自定义 `ResultCodec` Bean 覆盖）；
 窗口内的重复请求拿到首次结果（不执行业务方法）；首个请求**仍在处理中**时，重复请求仍按拒绝处理；
 业务异常的回滚行为与 REJECT 模式一致（`rollbackOnException`），异常本身不会被重放。
+返回值必须是默认 Jackson 及其已发现模块可序列化/反序列化的类型（例如 `LocalDateTime`、`Instant` 等
+JSR-310 时间类型需要类路径包含 `jackson-datatype-jsr310`）；也可通过自定义 `ResultCodec` 支持其他类型。
+REPLAY 的 TTL 必须大于业务最大耗时，否则占位过期后新请求会重新进入业务（幂等窗口失效，业务可能重复执行）；
+占位的回滚与结果保存均带归属令牌校验，不会误删或覆盖其他请求的占位（0.2.0 的覆盖串扰问题已修复）。
 自定义 `IdempotentPolicy` 需实现 `saveResult`/`loadResult` 并覆写 `supportsReplay()` 才能配合 REPLAY 使用，
 否则首次调用即抛出带修复指引的异常。
 
@@ -133,7 +137,8 @@ public void onGuardRejected(GuardRejectedEvent event) {
 
 | 指标 | 类型 | tag | 含义 |
 |---|---|---|---|
-| `guard_rejected_total` | Counter | `type` | 拒绝/超时请求数（`IDEMPOTENT_REJECTED` / `IDEMPOTENT_DEGRADED` / `LOCK_TIMEOUT`） |
+| `guard_rejected_total` | Counter | `type` | 拒绝/超时请求数（`IDEMPOTENT_REJECTED` / `IDEMPOTENT_DEGRADED`（fail-close 拒绝）/ `LOCK_TIMEOUT`） |
+| `guard_degraded_total` | Counter | `type=IDEMPOTENT_DEGRADED` | 策略故障降级次数（fail-open 放行与 fail-close 拒绝都计入；放行不计入 `guard_rejected_total`） |
 | `guard_replayed_total` | Counter | `type=IDEMPOTENT_REPLAYED` | REPLAY 模式下重放首次结果的次数 |
 | `guard_lock_acquire` | Timer | `type`（`REDIS` / `SYNCHRONIZED`） | 成功获取锁的耗时分布（含等待，Prometheus 渲染为 `guard_lock_acquire_seconds_*`） |
 
@@ -179,16 +184,20 @@ guard:
 
 | 场景 | 行为 |
 |---|---|
-| 业务异常（幂等，默认） | 释放占位，允许立即重试 |
+| 业务异常（幂等，默认） | 校验占位归属后释放，允许立即重试；不会误删 TTL 耗尽后其他请求新写入的占位 |
 | 业务异常（`rollbackOnException = false`） | 占位保留至 TTL，窗口内重试被拒绝 |
-| Redis 故障（幂等） | 按 `fail-open` 放行或拒绝，不抛基础设施异常 |
+| Redis 故障（幂等） | 按 `fail-open` 放行或拒绝，不抛基础设施异常；降级计入 `guard_degraded_total` |
 | key 表达式求值为 null/空白 | 快速失败抛 `KeyResolveException`（0.1.0 行为：静默回退方法级默认键，会导致防护粒度意外变粗） |
+| `@Idempotent` 配置错误（ttl ≤ 0、无策略 Bean、REPLAY 不支持等） | 首次调用抛带修复指引的 `IllegalStateException`，不进降级、不被 fail-open 吞掉 |
 | REPLAY 模式，重复请求且业务已完成 | 直接返回首次结果，不执行业务方法 |
 | REPLAY 模式，首个请求仍在处理中 | 重复请求按拒绝处理（不等待） |
+| REPLAY 模式，TTL 小于业务最大耗时 | 占位过期后新请求可重新进入业务（幂等窗口失效，业务可能重复执行）；结果保存带令牌校验，不会覆盖串扰；应将 TTL 设为大于业务最大耗时 |
+| REPLAY 模式，自定义 `ResultCodec` 保存原始字符串 | 避免产生以 `__guard:processing__:` 开头的内容（该前缀为处理中令牌保留值）；默认 Jackson JSON 不受影响 |
 | REPLAY 模式，结果保存/反序列化失败 | 保存失败退回拒绝行为并记 warn；反序列化失败拒绝请求并发布降级事件 |
 | REPLAY 模式，策略不支持重放 / 无 `ResultCodec` | 首次调用前抛出带修复指引的 `IllegalStateException` |
-| 容器无 `IdempotentPolicy` / `RedissonClient` Bean | 本地锁可正常使用；Redis 功能在首次实际调用时抛出带修复指引的异常 |
+| 容器无 `IdempotentPolicy` / `RedissonClient` Bean | 本地锁可正常使用；Redis 功能在首次实际调用时抛出带修复指引的异常（幂等侧即使 fail-open 也不放行） |
 | `leaseTime = -1`（默认） | Redis 锁使用 Redisson 看门狗自动续期，持锁至方法结束；本地锁忽略此属性 |
+| 锁等待被中断 | 恢复中断标记并抛 `LockAcquireInterruptedException`（`LockAcquireTimeoutException` 子类，现有异常处理器无需改动），与锁竞争超时区分 |
 | 锁释放 | Redis 锁在 finally 中校验当前线程持有后释放；本地锁在 finally 中释放并清理锁槽位 |
 | Redisson 初始化 | 不在 `LockAspect` / `LockTemplate` 实例化时要求 `RedissonClient`；仅实际使用 Redis 路径时校验 |
 

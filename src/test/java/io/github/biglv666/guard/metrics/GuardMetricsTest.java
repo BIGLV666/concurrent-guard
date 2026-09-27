@@ -25,10 +25,12 @@ class GuardMetricsTest {
         metrics.incrementRejected("LOCK_TIMEOUT");
         metrics.incrementRejected("LOCK_TIMEOUT");
         metrics.incrementReplayed("IDEMPOTENT_REPLAYED");
+        metrics.incrementDegraded("IDEMPOTENT_DEGRADED");
         metrics.recordLockAcquire("REDIS", 1_500_000);
 
         assertEquals(2.0, registry.get(GuardMetrics.REJECTED_COUNTER).tag("type", "LOCK_TIMEOUT").counter().count());
         assertEquals(1.0, registry.get(GuardMetrics.REPLAYED_COUNTER).tag("type", "IDEMPOTENT_REPLAYED").counter().count());
+        assertEquals(1.0, registry.get(GuardMetrics.DEGRADED_COUNTER).tag("type", "IDEMPOTENT_DEGRADED").counter().count());
         // 1.5ms 以纳秒记录，Prometheus 侧渲染为秒
         assertEquals(0.0015,
                 registry.get(GuardMetrics.LOCK_ACQUIRE_TIMER).tag("type", "REDIS").timer().totalTime(TimeUnit.SECONDS),
@@ -41,6 +43,7 @@ class GuardMetricsTest {
         GuardMetrics metrics = new GuardMetrics(provider(null));
         metrics.incrementRejected("LOCK_TIMEOUT");
         metrics.incrementReplayed("IDEMPOTENT_REPLAYED");
+        metrics.incrementDegraded("IDEMPOTENT_DEGRADED");
         metrics.recordLockAcquire("REDIS", 1_000);
     }
 

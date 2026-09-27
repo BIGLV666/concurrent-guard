@@ -12,6 +12,8 @@ import java.util.concurrent.TimeUnit;
  * 未引入时所有上报为空操作，零开销：
  * <ul>
  *   <li>{@code guard_rejected_total}（Counter，tag: type）：拒绝/超时请求数；</li>
+ *   <li>{@code guard_degraded_total}（Counter，tag: type）：策略故障降级次数
+ *       （fail-open 放行与 fail-close 拒绝都计入，放行不计入 {@code guard_rejected_total}）；</li>
  *   <li>{@code guard_replayed_total}（Counter，tag: type）：REPLAY 模式重放次数；</li>
  *   <li>{@code guard_lock_acquire}（Timer，tag: type=锁类型）：锁获取耗时分布（含 Prometheus 自动单位秒）。</li>
  * </ul>
@@ -28,6 +30,15 @@ public class GuardMetrics {
      * 计数器名称：被防护组件拒绝/超时的请求总数。
      */
     public static final String REJECTED_COUNTER = "guard_rejected_total";
+
+    /**
+     * 计数器名称：幂等策略故障的降级次数（含 fail-open 放行与 fail-close 拒绝）。
+     * 与 {@link #REJECTED_COUNTER} 分开计数：降级放行不是拒绝，
+     * 避免基于拒绝计数配置的告警把"可用性优先的放行"误报为拒绝。
+     *
+     * @since 0.2.1
+     */
+    public static final String DEGRADED_COUNTER = "guard_degraded_total";
 
     /**
      * 计数器名称：REPLAY 模式下结果被重放的请求总数。
@@ -73,6 +84,19 @@ public class GuardMetrics {
             return;
         }
         registry.counter(REPLAYED_COUNTER, "type", type).increment();
+    }
+
+    /**
+     * 累加一次策略故障降级计数（fail-open 放行与 fail-close 拒绝都计入）。
+     *
+     * @param type 事件类型，作为指标 tag「type」的值
+     * @since 0.2.1
+     */
+    public void incrementDegraded(String type) {
+        if (registry == null) {
+            return;
+        }
+        registry.counter(DEGRADED_COUNTER, "type", type).increment();
     }
 
     /**

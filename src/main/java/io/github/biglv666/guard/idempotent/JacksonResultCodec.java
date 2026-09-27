@@ -20,7 +20,7 @@ public class JacksonResultCodec implements ResultCodec {
      * 独立 ObjectMapper：不与宿主应用共享配置（如 Spring Boot 定制的模块注册），
      * 避免宿主对业务对象的定制序列化行为影响重放链路的确定性。
      */
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     @Override
     public String serialize(Object result) throws Exception {

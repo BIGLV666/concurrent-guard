@@ -12,7 +12,7 @@
 
     <groupId>io.github.biglv666</groupId>
     <artifactId>guard-spring-boot-starter</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.1-SNAPSHOT</version>
     <name>Guard Spring Boot Starter</name>
     <description>轻量级并发防护 Spring Boot Starter：注解式幂等（防重复提交，支持异常回滚、结果重放与自定义策略）与注解式分布式锁（Redisson）。</description>
     <url>https://github.com/BIGLV666/concurrent-guard</url>
@@ -98,6 +98,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- 验证默认编解码器自动发现 JSR-310 模块；运行时由宿主按需提供 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

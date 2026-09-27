@@ -2,6 +2,7 @@ package io.github.biglv666.guard.itest.lock;
 
 import io.github.biglv666.guard.lock.DistributedLock;
 import io.github.biglv666.guard.lock.LockAcquireFallbackHandler;
+import io.github.biglv666.guard.lock.LockAcquireInterruptedException;
 import io.github.biglv666.guard.lock.LockAcquirePolicy;
 import io.github.biglv666.guard.lock.LockAcquireTimeoutException;
 import io.github.biglv666.guard.lock.LockTemplate;
@@ -102,6 +103,33 @@ class LockIntegrationTest {
     void localAnnotatedLockWorks() {
         String key = "local-method-" + UUID.randomUUID();
         assertEquals("local:" + key, service.local(key, 1));
+    }
+
+    @Test
+    void interruptedAcquireThrowsInterruptException() throws Exception {
+        String key = "i-" + UUID.randomUUID();
+        Thread holder = new Thread(() -> service.local(key, 1000));
+        holder.start();
+        Thread.sleep(200);
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            try {
+                service.local(key, 1);
+            } catch (Throwable t) {
+                error.set(t);
+            }
+        });
+        waiter.start();
+        // 等待线程已阻塞在锁等待上再中断
+        Thread.sleep(100);
+        waiter.interrupt();
+        waiter.join(5000);
+        holder.join(5000);
+
+        // 中断与锁竞争超时语义不同：抛中断异常而非 LockAcquireTimeoutException
+        assertTrue(error.get() instanceof LockAcquireInterruptedException,
+                "等待被中断应抛 LockAcquireInterruptedException，实际: " + error.get());
+        assertTrue(waiter.isInterrupted(), "中断标记应被恢复");
     }
 
     @Test

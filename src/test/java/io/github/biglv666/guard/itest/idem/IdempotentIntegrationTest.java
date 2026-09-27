@@ -152,6 +152,15 @@ class IdempotentIntegrationTest {
         assertNotNull(redisTemplate.opsForValue().get("guard:idempotent:" + key));
     }
 
+    @Test
+    void zeroTtlFailsFastAsConfigError() {
+        // ttl <= 0 属于配置错误：快速失败抛 IllegalStateException，不进降级路径、不执行业务
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> service.zeroTtl("z"));
+        assertTrue(e.getMessage().contains("ttl"),
+                "错误信息应包含 ttl 修复指引，实际: " + e.getMessage());
+        assertEquals(0, App.IdemService.zeroTtlCalls.get());
+    }
+
     /**
      * 测试应用：组件扫描限定在本包，自动装配 Guard。
      */
@@ -167,6 +176,7 @@ class IdempotentIntegrationTest {
             static final AtomicInteger rollbackAttempts = new AtomicInteger();
             static final AtomicInteger noRollbackAttempts = new AtomicInteger();
             static final AtomicInteger methodLevelCalls = new AtomicInteger();
+            static final AtomicInteger zeroTtlCalls = new AtomicInteger();
 
             @Idempotent(key = "#orderId")
             public String submit(String orderId) {
@@ -194,6 +204,12 @@ class IdempotentIntegrationTest {
             public String methodLevel(String arg) {
                 methodLevelCalls.incrementAndGet();
                 return "ok";
+            }
+
+            @Idempotent(key = "#orderId", ttl = 0)
+            public String zeroTtl(String orderId) {
+                zeroTtlCalls.incrementAndGet();
+                return "ok:" + orderId;
             }
         }
 

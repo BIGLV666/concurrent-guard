@@ -23,10 +23,23 @@ import java.time.Duration;
  *   <li>{@link #release} 只应删除本次占位，不应影响其他调用方的占位。</li>
  * </ul>
  *
+ * <p>占位归属：切面统一走 {@link #tryAcquireToken} / {@link #releaseIfOwned} /
+ * {@link #saveResultIfOwned} 的令牌链路。只实现 {@link #tryAcquire} / {@link #release} 的
+ * 旧实现无需任何改动即可继续工作（default 方法委托到旧方法），但此时不具备占位归属校验，
+ * TTL 耗尽后其他请求的回滚可能误删占位；建议实现令牌链路以获得严格的归属保护。
+ *
  * @author Guard Team
  * @since 0.1.0
  */
 public interface IdempotentPolicy {
+
+    /**
+     * 旧版（不支持令牌）实现的占位令牌哨兵值：占位成功但策略无法提供归属令牌。
+     * 切面据此走无归属校验的旧语义（直接删除/直接覆盖），与 0.x 行为一致。
+     *
+     * @since 0.2.1
+     */
+    String NO_OWNER_TOKEN = "__guard:no-owner-token__";
 
     /**
      * 尝试为指定 key 获取幂等占位。
@@ -37,6 +50,59 @@ public interface IdempotentPolicy {
      * @throws Exception 实现自身故障时抛出，由切面统一降级处理
      */
     boolean tryAcquire(String key, Duration ttl);
+
+    /**
+     * 带归属令牌的占位获取，切面的标准入口。
+     *
+     * <p>占位成功时返回本次请求的专属令牌，供 {@link #releaseIfOwned} 与
+     * {@link #saveResultIfOwned} 校验占位归属；占位失败返回 null。
+     * 默认实现委托到 {@link #tryAcquire}，令牌为 {@link #NO_OWNER_TOKEN}
+     * （无归属校验语义，兼容旧实现）。
+     *
+     * @param key 完整幂等键（已含配置前缀）
+     * @param ttl 占位保持时长
+     * @return 占位成功返回非 null 令牌；占位失败返回 null
+     * @throws Exception 实现自身故障时抛出，由切面统一降级处理
+     * @since 0.2.1
+     */
+    default String tryAcquireToken(String key, Duration ttl) {
+        return tryAcquire(key, ttl) ? NO_OWNER_TOKEN : null;
+    }
+
+    /**
+     * 校验占位归属后释放（回滚）指定 key 的占位，用于业务方法异常后的重试放行。
+     *
+     * <p>仅当占位仍属于 {@code token} 对应的本次请求时才删除，避免 TTL 耗尽后
+     * 误删其他请求新写入的占位。默认实现委托到 {@link #release}（无归属校验）。
+     *
+     * @param key   完整幂等键（已含配置前缀）
+     * @param token {@link #tryAcquireToken} 返回的令牌
+     * @throws Exception 实现自身故障时抛出；切面仅记录告警，不影响原异常传播
+     * @since 0.2.1
+     */
+    default void releaseIfOwned(String key, String token) {
+        release(key);
+    }
+
+    /**
+     * 校验占位归属后保存业务方法正常返回的结果，供窗口内的重复请求重放。
+     *
+     * <p>仅当占位仍属于 {@code token} 对应的本次请求时才写入，避免 TTL 耗尽后
+     * 覆盖其他请求的占位造成结果串扰。默认实现委托到 {@link #saveResult}（无归属校验）。
+     *
+     * <p>仅在 {@link #supportsReplay()} 为 true 时会被调用，且调用发生在
+     * {@link #tryAcquireToken} 占位成功、业务方法正常返回之后。
+     *
+     * @param key     完整幂等键（与占位键相同）
+     * @param token   {@link #tryAcquireToken} 返回的令牌
+     * @param payload 序列化后的结果内容（由 {@link ResultCodec} 编码）
+     * @param ttl     结果保持时长（与占位 TTL 一致）
+     * @throws Exception 实现自身故障时抛出；切面仅记录告警，不影响业务返回值
+     * @since 0.2.1
+     */
+    default void saveResultIfOwned(String key, String token, String payload, Duration ttl) {
+        saveResult(key, payload, ttl);
+    }
 
     /**
      * 释放（回滚）指定 key 的幂等占位，用于业务方法异常后的重试放行。

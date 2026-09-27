@@ -96,6 +96,7 @@ public class LockAspect {
         LocalLockManager.Handle localHandle = null;
         RLock redisLock = null;
         boolean locked = false;
+        boolean interrupted = false;
         long acquireStart = System.nanoTime();
         try {
             if (distributedLock.type() == LockType.SYNCHRONIZED) {
@@ -104,6 +105,7 @@ public class LockAspect {
                     locked = localHandle.lock().tryLock(distributedLock.waitTime(), distributedLock.timeUnit());
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    interrupted = true;
                     log.warn("本地锁等待被中断 - key: {}, method: {}", key, method.getName());
                 }
             } else {
@@ -112,12 +114,19 @@ public class LockAspect {
                     locked = redisLock.tryLock(distributedLock.waitTime(), distributedLock.leaseTime(), distributedLock.timeUnit());
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    interrupted = true;
                     log.warn("Redis 锁等待被中断 - key: {}, method: {}", key, method.getName());
                 }
             }
             if (!locked) {
                 metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
-                publish(key, method);
+                publish(key, method, interrupted ? "锁等待被中断" : "锁等待超时");
+                if (interrupted) {
+                    // 中断意味着调用方取消/线程关闭，与锁竞争超时语义不同：
+                    // 无论获取失败策略如何，都以中断异常终止（中断标记已在上方恢复）
+                    throw new LockAcquireInterruptedException(key,
+                            "获取锁等待被中断: " + key);
+                }
                 return handleTimeout(pjp, distributedLock, key, method);
             }
             // 成功获取（含等待时间）计入锁耗时分布；超时失败已计入拒绝指标，不重复记录
@@ -192,10 +201,10 @@ public class LockAspect {
         }
     }
 
-    private void publish(String key, Method method) {
+    private void publish(String key, Method method, String reason) {
         if (eventPublisher != null) {
             eventPublisher.publishEvent(new GuardRejectedEvent(GuardEventType.LOCK_TIMEOUT, key,
-                    method.getDeclaringClass().getName() + "#" + method.getName(), "锁等待超时"));
+                    method.getDeclaringClass().getName() + "#" + method.getName(), reason));
         }
     }
 

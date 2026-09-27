@@ -112,7 +112,7 @@ public class LockTemplate {
             return action.get();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw timeout(fullKey, waitTime, unit);
+            throw new LockAcquireInterruptedException(fullKey, "锁等待被中断: " + fullKey);
         } finally {
             if (locked) handle.lock().unlock();
             handle.close();
@@ -141,6 +141,7 @@ public class LockTemplate {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.warn("LockTemplate 锁等待被中断 - key: {}", fullKey);
+            throw new LockAcquireInterruptedException(fullKey, "锁等待被中断: " + fullKey);
         }
         if (!locked) {
             throw timeout(fullKey, waitTime, unit);

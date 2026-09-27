@@ -23,13 +23,16 @@ import java.time.Duration;
  * <p>执行流程：
  * <ol>
  *   <li>解析 key（SpEL 或方法级默认键），拼接配置前缀；</li>
- *   <li>通过 {@link IdempotentPolicy} 尝试占位：占位失败抛 {@link IdempotentRejectedException}；
- *       策略故障按 fail-open（放行不占位）/ fail-close（拒绝）降级；</li>
+ *   <li>装配与配置校验（策略 Bean 存在、REPLAY 支持重放、ttl 合法）——
+ *       属于编程/配置错误，在降级路径之外直接抛出带修复指引的 {@link IllegalStateException}，
+ *       绝不被 fail-open 吞掉；</li>
+ *   <li>通过 {@link IdempotentPolicy} 带令牌占位：占位失败抛 {@link IdempotentRejectedException}；
+ *       策略实现自身故障按 fail-open（放行不占位）/ fail-close（拒绝）降级；</li>
  *   <li>REPLAY 模式下占位失败时先尝试结果重放：窗口内业务已完成的同 key 请求
  *       直接返回首次结果，仍在处理中或结果不可用时退回拒绝；</li>
  *   <li>占位成功后执行业务：正常返回则占位保留至 TTL（REPLAY 模式下同时保存序列化结果）；
  *       业务异常时按 {@code rollbackOnException} 决定是否释放占位
- *       （释放失败仅记日志，不吞原异常）。</li>
+ *       （释放与保存均校验占位归属，不会误伤其他请求的占位；释放失败仅记日志，不吞原异常）。</li>
  * </ol>
  *
  * <p>拒绝与降级拒绝都会发布 {@link GuardRejectedEvent} 并累加 Micrometer 指标。
@@ -85,27 +88,33 @@ public class IdempotentAspect {
         Duration ttl = Duration.ofMillis(idempotent.timeUnit().toMillis(idempotent.ttl()));
         IdempotentMode mode = idempotent.mode();
 
+        // 装配与配置校验：策略缺失、REPLAY 不支持、ttl 非法属于编程/配置错误，
+        // 必须在降级路径之外快速失败，避免被 fail-open 当作基础设施故障静默放行
+        if (ttl.isZero() || ttl.isNegative()) {
+            throw new IllegalStateException("@Idempotent 的 ttl 必须大于 0，当前配置: "
+                    + idempotent.ttl() + " " + idempotent.timeUnit() + " - method: " + method.getName());
+        }
+        IdempotentPolicy policy = requirePolicy();
+        ResultCodec codec = null;
         if (mode == IdempotentMode.REPLAY) {
-            // 配置错误在占位前快速失败，避免先占用键再暴露问题
-            requireReplaySupport();
+            codec = requireReplaySupport(policy);
         }
 
-        boolean acquired;
+        String token;
         try {
-            acquired = requirePolicy().tryAcquire(key, ttl);
+            token = policy.tryAcquireToken(key, ttl);
         } catch (Exception e) {
             // 策略实现自身故障：统一降级，不把基础设施故障直接抛给业务
-            acquired = degradeOnPolicyFailure(key, method, e);
-            if (!acquired) {
+            if (!degradeOnPolicyFailure(key, method, e)) {
                 throw new IdempotentRejectedException(key, "服务暂不可用，请稍后重试");
             }
             // fail-open：不占位直接放行，本次请求不做幂等防护
             return pjp.proceed();
         }
 
-        if (!acquired) {
+        if (token == null) {
             if (mode == IdempotentMode.REPLAY) {
-                Object replayed = tryReplay(key, method);
+                Object replayed = tryReplay(policy, codec, key, method);
                 if (replayed != REPLAY_NONE) {
                     return replayed;
                 }
@@ -116,12 +125,12 @@ public class IdempotentAspect {
         try {
             Object result = pjp.proceed();
             if (mode == IdempotentMode.REPLAY) {
-                saveResultQuietly(key, result, ttl);
+                saveResultQuietly(policy, codec, key, token, result, ttl);
             }
             return result;
         } catch (Throwable businessError) {
             if (idempotent.rollbackOnException()) {
-                releaseQuietly(key, businessError);
+                releaseQuietly(policy, key, token, businessError);
             }
             throw businessError;
         }
@@ -135,23 +144,24 @@ public class IdempotentAspect {
      *
      * @return 重放的返回值；无可重放结果时返回 {@link #REPLAY_NONE} 哨兵
      */
-    private Object tryReplay(String key, Method method) {
+    private Object tryReplay(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
         String payload;
         try {
-            payload = requirePolicy().loadResult(key);
+            payload = policy.loadResult(key);
         } catch (Exception e) {
             log.warn("幂等结果重放查询故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
                     key, method.getName(), e.getMessage());
             publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "结果重放查询故障，fail-close: " + e.getMessage());
             metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+            metrics.incrementDegraded(GuardEventType.IDEMPOTENT_DEGRADED.name());
             return REPLAY_NONE;
         }
         if (payload == null) {
-            // 首个请求仍在处理中（占位值还是处理中标记），无结果可重放
+            // 首个请求仍在处理中（占位值还是处理中令牌），无结果可重放
             return REPLAY_NONE;
         }
         try {
-            Object replayed = requireCodec().deserialize(payload, method.getGenericReturnType());
+            Object replayed = codec.deserialize(payload, method.getGenericReturnType());
             metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
             return replayed;
         } catch (Exception e) {
@@ -159,17 +169,20 @@ public class IdempotentAspect {
                     key, method.getName(), e.getMessage());
             publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "重放结果反序列化失败: " + e.getMessage());
             metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+            metrics.incrementDegraded(GuardEventType.IDEMPOTENT_DEGRADED.name());
             return REPLAY_NONE;
         }
     }
 
     /**
-     * 保存业务结果供重复请求重放。保存失败仅记 warn：
-     * 占位键保持"处理中"标记，窗口内重复请求退回拒绝行为，不影响业务返回值。
+     * 保存业务结果供重复请求重放。保存前校验占位归属（令牌不符时跳过写入，
+     * 避免覆盖其他请求的占位）；保存失败仅记 warn：
+     * 占位键保持"处理中"令牌，窗口内重复请求退回拒绝行为，不影响业务返回值。
      */
-    private void saveResultQuietly(String key, Object result, Duration ttl) {
+    private void saveResultQuietly(IdempotentPolicy policy, ResultCodec codec,
+                                   String key, String token, Object result, Duration ttl) {
         try {
-            requirePolicy().saveResult(key, requireCodec().serialize(result), ttl);
+            policy.saveResultIfOwned(key, token, codec.serialize(result), ttl);
         } catch (Exception e) {
             log.warn("幂等结果保存失败，窗口内重复请求将退回拒绝行为 - key: {}, 错误: {}", key, e.getMessage());
         }
@@ -178,9 +191,10 @@ public class IdempotentAspect {
     /**
      * REPLAY 模式的前置校验：策略不支持重放、或容器中没有 ResultCodec 时，
      * 在占位前抛出清晰的配置错误（而非静默降级为拒绝模式）。
+     *
+     * @return 校验通过的结果编解码器
      */
-    private void requireReplaySupport() {
-        IdempotentPolicy policy = requirePolicy();
+    private ResultCodec requireReplaySupport(IdempotentPolicy policy) {
         if (!policy.supportsReplay()) {
             throw new IllegalStateException(
                     "@Idempotent(mode = REPLAY) 要求 IdempotentPolicy 支持结果重放，"
@@ -188,7 +202,7 @@ public class IdempotentAspect {
                             + "请实现 saveResult/loadResult 并覆写 supportsReplay()，或改用默认的"
                             + " RedisSetNxIdempotentPolicy / mode = REJECT。");
         }
-        requireCodec();
+        return requireCodec();
     }
 
     /**
@@ -215,20 +229,22 @@ public class IdempotentAspect {
     }
 
     /**
-     * 策略故障降级决策：fail-open 返回 true（放行）并记告警日志；
-     * fail-close 发布降级事件、累加指标并返回 false（调用方将拒绝请求）。
+     * 策略故障降级决策：fail-open 返回 true（放行）并记告警日志，降级计入
+     * {@code guard_degraded_total}（放行不是拒绝，不计入 {@code guard_rejected_total}）；
+     * fail-close 发布降级事件、同时累加降级与拒绝指标并返回 false（调用方将拒绝请求）。
      */
     private boolean degradeOnPolicyFailure(String key, Method method, Exception cause) {
         if (properties.isFailOpen()) {
             log.warn("幂等策略故障，fail-open 放行（本次不做幂等防护） - key: {}, method: {}, 错误: {}",
                     key, method.getName(), cause.getMessage());
-            metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+            metrics.incrementDegraded(GuardEventType.IDEMPOTENT_DEGRADED.name());
             return true;
         }
         log.warn("幂等策略故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
                 key, method.getName(), cause.getMessage());
         publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "幂等策略故障，fail-close: " + cause.getMessage());
         metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
+        metrics.incrementDegraded(GuardEventType.IDEMPOTENT_DEGRADED.name());
         return false;
     }
 
@@ -242,11 +258,13 @@ public class IdempotentAspect {
     }
 
     /**
-     * 业务异常后释放占位。释放失败仅记 warn，绝不覆盖正在传播的业务异常。
+     * 业务异常后释放占位。释放前校验占位归属（令牌不符时跳过删除，
+     * 避免误删 TTL 耗尽后其他请求新写入的占位）。
+     * 释放失败仅记 warn，绝不覆盖正在传播的业务异常。
      */
-    private void releaseQuietly(String key, Throwable businessError) {
+    private void releaseQuietly(IdempotentPolicy policy, String key, String token, Throwable businessError) {
         try {
-            requirePolicy().release(key);
+            policy.releaseIfOwned(key, token);
         } catch (Exception releaseError) {
             log.warn("幂等占位回滚失败，TTL 内重试可能被拒绝 - key: {}, 业务异常: {}, 回滚错误: {}",
                     key, businessError.getClass().getSimpleName(), releaseError.getMessage());
