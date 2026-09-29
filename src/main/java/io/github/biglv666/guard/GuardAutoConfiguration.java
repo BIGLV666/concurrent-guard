@@ -27,6 +27,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.data.redis.core.RedisOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
+import java.time.Duration;
+
 /**
  * Guard 并发防护组件的自动装配入口。
  *
@@ -74,14 +76,17 @@ public class GuardAutoConfiguration {
     static class IdempotentConfiguration {
 
         /**
-         * 默认幂等策略（Redis setnx）：用户注册自定义 IdempotentPolicy Bean 时此处不装配。
+         * 默认幂等策略（Redis setnx + 令牌归属 + 慢请求完成哨兵）：
+         * 用户注册自定义 IdempotentPolicy Bean 时此处不装配。
          * 依赖 StringRedisTemplate（Redis 自动配置提供），故声明在 RedisAutoConfiguration 之后判定。
          */
         @Bean
         @ConditionalOnMissingBean(IdempotentPolicy.class)
         @ConditionalOnBean(StringRedisTemplate.class)
-        public IdempotentPolicy idempotentPolicy(StringRedisTemplate redisTemplate) {
-            return new RedisSetNxIdempotentPolicy(redisTemplate);
+        public IdempotentPolicy idempotentPolicy(StringRedisTemplate redisTemplate,
+                                                 GuardProperties guardProperties) {
+            return new RedisSetNxIdempotentPolicy(redisTemplate,
+                    Duration.ofMillis(guardProperties.getIdempotent().getReplayGraceMillis()));
         }
 
         @Bean

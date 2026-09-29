@@ -133,6 +133,29 @@ class IdempotentReplayIntegrationTest {
         assertEquals(2, service.fastTtlCalls.get());
     }
 
+    @Test
+    void slowResultReplayedFromSentinelWithinGraceWindow() throws Exception {
+        String key = "grace-" + UUID.randomUUID();
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        service.beginSlow();
+        try {
+            // 业务耗时 600ms 但占位 TTL 只有 200ms：首个请求执行期间占位必然过期
+            Future<String> first = pool.submit(() -> service.slowTtl(key));
+            assertTrue(service.entered.await(5, TimeUnit.SECONDS));
+
+            // 等待占位过期（200ms TTL + 余量），再释放业务让其完成并写哨兵
+            Thread.sleep(350);
+            service.finishSlow();
+            assertEquals("slow-ttl:" + key, first.get(5, TimeUnit.SECONDS));
+
+            // 过期窗口内（默认哨兵保留 5 秒）：重复请求从哨兵重放结果，业务方法不重复执行
+            assertEquals("slow-ttl:" + key, service.slowTtl(key));
+            assertEquals(1, service.slowTtlCalls.get());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     /**
      * 测试应用：组件扫描限定在本包，自动装配 Guard（默认 JacksonResultCodec）。
      */
@@ -151,6 +174,7 @@ class IdempotentReplayIntegrationTest {
             static final AtomicInteger noRollbackAttempts = new AtomicInteger();
             static final AtomicInteger voidCalls = new AtomicInteger();
             static final AtomicInteger fastTtlCalls = new AtomicInteger();
+            static final AtomicInteger slowTtlCalls = new AtomicInteger();
 
             static volatile CountDownLatch entered = new CountDownLatch(1);
             static volatile CountDownLatch processing = new CountDownLatch(1);
@@ -202,6 +226,14 @@ class IdempotentReplayIntegrationTest {
             public String fastTtl(String orderId) {
                 fastTtlCalls.incrementAndGet();
                 return "ok:" + orderId;
+            }
+
+            @Idempotent(key = "#orderId", mode = IdempotentMode.REPLAY, ttl = 200, timeUnit = TimeUnit.MILLISECONDS)
+            public String slowTtl(String orderId) throws InterruptedException {
+                slowTtlCalls.incrementAndGet();
+                entered.countDown();
+                processing.await(5, TimeUnit.SECONDS);
+                return "slow-ttl:" + orderId;
             }
         }
 

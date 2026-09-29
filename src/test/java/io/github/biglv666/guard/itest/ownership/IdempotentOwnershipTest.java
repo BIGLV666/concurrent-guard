@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 幂等占位归属校验集成测试（Testcontainers 真实 Redis）：
@@ -121,6 +122,51 @@ class IdempotentOwnershipTest {
         // 令牌匹配后保存结果：可正常加载
         policy.saveResultIfOwned(key, token, "payload", TTL);
         assertEquals("payload", policy.loadResult(key));
+    }
+
+    @Test
+    void expiredPlaceholderWritesReplaySentinel() {
+        String key = "own-sentinel-" + UUID.randomUUID();
+        String token = policy.tryAcquireToken(key, TTL);
+        assertNotNull(token);
+
+        // 模拟占位过期（慢请求业务耗时略超 TTL）：键被删除
+        redisTemplate.delete(key);
+
+        // 慢请求完成后写哨兵：过期窗口内的重复请求可重放结果
+        policy.saveResultIfExpired(key, token, "{\"expired\":true}", TTL);
+        assertEquals("{\"expired\":true}", policy.loadExpiredResult(key));
+        // 主键上仍无占位（哨兵与主占位分离）
+        assertNull(redisTemplate.opsForValue().get(key));
+    }
+
+    @Test
+    void acquiredPlaceholderDoesNotWriteSentinel() {
+        String key = "own-nosentinel-" + UUID.randomUUID();
+        String token = policy.tryAcquireToken(key, TTL);
+        assertNotNull(token);
+
+        // 模拟占位被其他请求接管（易主而非过期）
+        redisTemplate.opsForValue().set(key, "__guard:processing__:foreign-" + UUID.randomUUID(), TTL);
+
+        // 不写哨兵：避免旧请求的结果被新占位场景下的重复请求误重放
+        policy.saveResultIfExpired(key, token, "{\"stale\":true}", TTL);
+        assertNull(policy.loadExpiredResult(key));
+    }
+
+    @Test
+    void remainingTtlReflectsPlaceholderLifetime() {
+        String key = "own-ttl-" + UUID.randomUUID();
+        String token = policy.tryAcquireToken(key, TTL);
+        assertNotNull(token);
+
+        long remaining = policy.remainingTtlMillis(key);
+        // 刚占位的键剩余 TTL 应接近 10s（允许少量执行耗时）
+        assertTrue(remaining > 0 && remaining <= TTL.toMillis(),
+                "剩余 TTL 应在 (0, " + TTL.toMillis() + "] 区间，实际: " + remaining);
+
+        // 不存在的键返回 -1（未知）
+        assertEquals(-1, policy.remainingTtlMillis("own-ttl-" + UUID.randomUUID()));
     }
 
     /**

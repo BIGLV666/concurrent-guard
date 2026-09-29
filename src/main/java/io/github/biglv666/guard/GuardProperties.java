@@ -81,8 +81,19 @@ public class GuardProperties {
          * Redis 故障时的降级策略：
          * true = fail-open（放行业务请求，优先可用性）；
          * false = fail-close（拒绝请求并抛出异常，优先一致性）。
+         *
+         * <p>注意：配置错误（无 IdempotentPolicy Bean、REPLAY 策略不支持、ttl 非法）
+         * 不受 fail-open 影响，一律快速失败抛 {@link IllegalStateException}。
          */
         private boolean failOpen = true;
+
+        /**
+         * 慢请求完成哨兵的保留时长（毫秒），默认 5000。
+         * REPLAY 模式下业务耗时略超占位 TTL 时，结果写入哨兵键供过期窗口内的
+         * 重复请求重放；超过该窗口则与"TTL 过期后重新执行"语义一致。
+         * 仅对默认 {@code RedisSetNxIdempotentPolicy} 生效，自定义策略按自身实现处理。
+         */
+        private long replayGraceMillis = 5000;
 
         public boolean isEnabled() {
             return enabled;
@@ -106,6 +117,14 @@ public class GuardProperties {
 
         public void setFailOpen(boolean failOpen) {
             this.failOpen = failOpen;
+        }
+
+        public long getReplayGraceMillis() {
+            return replayGraceMillis;
+        }
+
+        public void setReplayGraceMillis(long replayGraceMillis) {
+            this.replayGraceMillis = replayGraceMillis;
         }
     }
 

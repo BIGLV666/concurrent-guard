@@ -78,6 +78,9 @@ class IdempotentIntegrationTest {
         IdempotentRejectedException rejected =
                 assertThrows(IdempotentRejectedException.class, () -> service.fastTtl(key));
         assertNotNull(rejected.getKey());
+        // 拒绝异常携带占位剩余 TTL（刚占位的键应接近 300ms）
+        assertTrue(rejected.getRemainingTtlMillis() > 0 && rejected.getRemainingTtlMillis() <= 300,
+                "剩余 TTL 应在 (0, 300] 区间，实际: " + rejected.getRemainingTtlMillis());
         assertEquals(1, collector.count(GuardEventType.IDEMPOTENT_REJECTED));
 
         Thread.sleep(450);

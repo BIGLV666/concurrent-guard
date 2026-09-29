@@ -38,9 +38,15 @@ jobs:
         run: |
           echo "$GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import
 
+      # 发布前显式全量验证（含 Testcontainers 集成测试），
+      # 测试失败时流水线在此终止，不会执行 deploy 与 Release 创建
+      - name: Verify before publish
+        run: ./mvnw -B clean verify
+
       - name: Publish signed artifacts
         run: |
-          mvn -B clean deploy -Prelease \
+          mvn -B deploy -Prelease \
+            -DskipTests \
             -Dgpg.passphrase="$GPG_PASSPHRASE" \
             --no-transfer-progress
 

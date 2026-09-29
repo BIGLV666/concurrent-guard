@@ -119,7 +119,17 @@ public class IdempotentAspect {
                     return replayed;
                 }
             }
-            reject(key, method, idempotent.message());
+            reject(policy, key, method, idempotent.message());
+        }
+
+        // 占位成功但发现慢请求完成哨兵：前一个请求业务已完成、占位已过期，
+        // 本次直接重放哨兵结果并释放刚占的位，避免业务重复执行
+        if (mode == IdempotentMode.REPLAY) {
+            Object sentinelReplayed = tryReplaySentinel(policy, codec, key, method);
+            if (sentinelReplayed != REPLAY_NONE) {
+                releaseQuietly(policy, key, token, null);
+                return sentinelReplayed;
+            }
         }
 
         try {
@@ -148,6 +158,11 @@ public class IdempotentAspect {
         String payload;
         try {
             payload = policy.loadResult(key);
+            // 主占位读不到结果时，回查慢请求完成哨兵（首个请求业务略超 TTL、
+            // 占位已过期但结果刚写入哨兵的场景），过期窗口内仍允许重放而非拒绝
+            if (payload == null) {
+                payload = policy.loadExpiredResult(key);
+            }
         } catch (Exception e) {
             log.warn("幂等结果重放查询故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
                     key, method.getName(), e.getMessage());
@@ -175,14 +190,41 @@ public class IdempotentAspect {
     }
 
     /**
+     * 占位成功后回查慢请求完成哨兵：哨兵存在说明前一个请求业务已完成、
+     * 占位已过期，本次应重放其结果而非重复执行业务。
+     * 查询或反序列化失败按无哨兵处理（正常执行业务），不影响主链路可用性。
+     *
+     * @return 哨兵中的重放结果；无哨兵时返回 {@link #REPLAY_NONE} 哨兵
+     */
+    private Object tryReplaySentinel(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
+        try {
+            String payload = policy.loadExpiredResult(key);
+            if (payload == null) {
+                return REPLAY_NONE;
+            }
+            Object replayed = codec.deserialize(payload, method.getGenericReturnType());
+            metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
+            return replayed;
+        } catch (Exception e) {
+            log.warn("慢请求完成哨兵查询/反序列化失败，按无哨兵继续执行业务 - key: {}, method: {}, 错误: {}",
+                    key, method.getName(), e.getMessage());
+            return REPLAY_NONE;
+        }
+    }
+
+    /**
      * 保存业务结果供重复请求重放。保存前校验占位归属（令牌不符时跳过写入，
-     * 避免覆盖其他请求的占位）；保存失败仅记 warn：
-     * 占位键保持"处理中"令牌，窗口内重复请求退回拒绝行为，不影响业务返回值。
+     * 避免覆盖其他请求的占位）；令牌不匹配且占位已过期时写入慢请求完成哨兵，
+     * 供过期窗口内到达的重复请求重放。保存失败仅记 warn：不影响业务返回值。
      */
     private void saveResultQuietly(IdempotentPolicy policy, ResultCodec codec,
                                    String key, String token, Object result, Duration ttl) {
         try {
-            policy.saveResultIfOwned(key, token, codec.serialize(result), ttl);
+            String payload = codec.serialize(result);
+            // 先按归属写主占位；未写入（过期或易主）再尝试过期哨兵——
+            // 哨兵仅覆盖"业务略超 TTL"的边界窗口，被他人接管时不写避免串扰
+            policy.saveResultIfOwned(key, token, payload, ttl);
+            policy.saveResultIfExpired(key, token, payload, ttl);
         } catch (Exception e) {
             log.warn("幂等结果保存失败，窗口内重复请求将退回拒绝行为 - key: {}, 错误: {}", key, e.getMessage());
         }
@@ -249,12 +291,19 @@ public class IdempotentAspect {
     }
 
     /**
-     * 拒绝重复请求：发布事件、累加指标并抛出携带注解消息的异常。
+     * 拒绝重复请求：发布事件、累加指标并抛出携带注解消息与占位剩余 TTL 的异常。
+     * 剩余 TTL 查询失败不影响拒绝本身（降级为 -1 未知）。
      */
-    private void reject(String key, Method method, String message) throws IdempotentRejectedException {
+    private void reject(IdempotentPolicy policy, String key, Method method, String message) throws IdempotentRejectedException {
         publish(GuardEventType.IDEMPOTENT_REJECTED, key, method, "TTL 窗口内重复请求");
         metrics.incrementRejected(GuardEventType.IDEMPOTENT_REJECTED.name());
-        throw new IdempotentRejectedException(key, message);
+        long remainingTtl;
+        try {
+            remainingTtl = policy.remainingTtlMillis(key);
+        } catch (Exception e) {
+            remainingTtl = -1;
+        }
+        throw new IdempotentRejectedException(key, message, remainingTtl);
     }
 
     /**
@@ -266,8 +315,10 @@ public class IdempotentAspect {
         try {
             policy.releaseIfOwned(key, token);
         } catch (Exception releaseError) {
-            log.warn("幂等占位回滚失败，TTL 内重试可能被拒绝 - key: {}, 业务异常: {}, 回滚错误: {}",
-                    key, businessError.getClass().getSimpleName(), releaseError.getMessage());
+            log.warn("幂等占位释放失败，TTL 内重试可能被拒绝 - key: {}, 触发场景: {}, 释放错误: {}",
+                    key,
+                    businessError != null ? "业务异常 " + businessError.getClass().getSimpleName() : "哨兵重放占位回收",
+                    releaseError.getMessage());
         }
     }
 

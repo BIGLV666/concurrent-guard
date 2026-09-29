@@ -53,6 +53,8 @@ REPLAY 模式行为：首个请求正常返回后，返回值被序列化保存�
 JSR-310 时间类型需要类路径包含 `jackson-datatype-jsr310`）；也可通过自定义 `ResultCodec` 支持其他类型。
 REPLAY 的 TTL 必须大于业务最大耗时，否则占位过期后新请求会重新进入业务（幂等窗口失效，业务可能重复执行）；
 占位的回滚与结果保存均带归属令牌校验，不会误删或覆盖其他请求的占位（0.2.0 的覆盖串扰问题已修复）。
+业务耗时仅略超 TTL 时，结果会写入短期哨兵键（默认 5 秒，可配 `guard.idempotent.replay-grace-millis`），
+过期窗口内到达的重复请求仍可重放，不必把 TTL 配得过大；占位被新请求接管（而非过期）时不写哨兵，不会串扰。
 自定义 `IdempotentPolicy` 需实现 `saveResult`/`loadResult` 并覆写 `supportsReplay()` 才能配合 REPLAY 使用，
 否则首次调用即抛出带修复指引的异常。
 
@@ -150,11 +152,14 @@ Web 应用中，拒绝异常未被处理时默认返回 500。推荐用全局异
 @RestControllerAdvice
 public class GuardExceptionAdvice {
 
-    // 幂等拒绝 → 409 Conflict
+    // 幂等拒绝 → 409 Conflict；remainingTtlMillis 提示调用方还需等待多久（-1 表示未知）
     @ExceptionHandler(IdempotentRejectedException.class)
-    public ResponseEntity<Map<String, String>> onIdempotentRejected(IdempotentRejectedException e) {
-        return ResponseEntity.status(HttpStatus.CONFLICT)
-                .body(Map.of("code", "IDEMPOTENT_REJECTED", "message", e.getMessage()));
+    public ResponseEntity<Map<String, Object>> onIdempotentRejected(IdempotentRejectedException e) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", "IDEMPOTENT_REJECTED");
+        body.put("message", e.getMessage());
+        body.put("remainingTtlMillis", e.getRemainingTtlMillis());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
 
     // 锁等待超时 → 503，提示调用方稍后重试
@@ -175,6 +180,8 @@ guard:
     enabled: true
     key-prefix: "guard:idempotent:"
     fail-open: true             # Redis 故障时 true=放行（可用性优先）false=拒绝（一致性优先）
+                                # 注意：配置错误（无策略 Bean / REPLAY 不支持 / ttl 非法）不受 fail-open 影响，一律快速失败
+    replay-grace-millis: 5000   # REPLAY 慢请求完成哨兵保留时长（仅默认 Redis 策略生效）
   lock:
     enabled: true
     key-prefix: "guard:lock:"
@@ -191,7 +198,8 @@ guard:
 | `@Idempotent` 配置错误（ttl ≤ 0、无策略 Bean、REPLAY 不支持等） | 首次调用抛带修复指引的 `IllegalStateException`，不进降级、不被 fail-open 吞掉 |
 | REPLAY 模式，重复请求且业务已完成 | 直接返回首次结果，不执行业务方法 |
 | REPLAY 模式，首个请求仍在处理中 | 重复请求按拒绝处理（不等待） |
-| REPLAY 模式，TTL 小于业务最大耗时 | 占位过期后新请求可重新进入业务（幂等窗口失效，业务可能重复执行）；结果保存带令牌校验，不会覆盖串扰；应将 TTL 设为大于业务最大耗时 |
+| REPLAY 模式，TTL 小于业务最大耗时 | 占位过期后新请求可重新进入业务（幂等窗口失效，业务可能重复执行）；结果保存带令牌校验，不会覆盖串扰；业务略超 TTL 时结果写入短期哨兵键，过期窗口内重复请求仍可重放 |
+| REPLAY 模式，慢请求完成哨兵 | 占位已过期（非被接管）时结果写入哨兵键（默认保留 5 秒，可配 `guard.idempotent.replay-grace-millis`），过期窗口内重复请求重放哨兵结果；占位被新请求接管时不写哨兵 |
 | REPLAY 模式，自定义 `ResultCodec` 保存原始字符串 | 避免产生以 `__guard:processing__:` 开头的内容（该前缀为处理中令牌保留值）；默认 Jackson JSON 不受影响 |
 | REPLAY 模式，结果保存/反序列化失败 | 保存失败退回拒绝行为并记 warn；反序列化失败拒绝请求并发布降级事件 |
 | REPLAY 模式，策略不支持重放 / 无 `ResultCodec` | 首次调用前抛出带修复指引的 `IllegalStateException` |
@@ -200,6 +208,19 @@ guard:
 | 锁等待被中断 | 恢复中断标记并抛 `LockAcquireInterruptedException`（`LockAcquireTimeoutException` 子类，现有异常处理器无需改动），与锁竞争超时区分 |
 | 锁释放 | Redis 锁在 finally 中校验当前线程持有后释放；本地锁在 finally 中释放并清理锁槽位 |
 | Redisson 初始化 | 不在 `LockAspect` / `LockTemplate` 实例化时要求 `RedissonClient`；仅实际使用 Redis 路径时校验 |
+
+## 从 0.2.0 升级
+
+- **自定义 `IdempotentPolicy` 零改动可运行**：新增的令牌链路（`tryAcquireToken` / `releaseIfOwned` /
+  `saveResultIfOwned`）、慢请求哨兵（`saveResultIfExpired` / `loadExpiredResult`）与剩余 TTL 查询
+  （`remainingTtlMillis`）均为 default 方法，旧实现自动获得无归属校验的兼容语义；
+  实现令牌方法可获得"回滚/保存不误伤他人占位"的严格保护（默认 Redis 策略已实现）。
+- **配置错误语义收紧**：无 `IdempotentPolicy` Bean、REPLAY 策略不支持、`ttl <= 0`
+  在 0.2.0 会被 fail-open 静默放行，0.2.1 起一律快速失败抛 `IllegalStateException`。
+- **指标变化**：fail-open 降级放行不再计入 `guard_rejected_total`，改计新增的
+  `guard_degraded_total`；基于拒绝计数配置的告警规则不受影响。
+- **锁中断语义**：等待加锁被中断现在抛 `LockAcquireInterruptedException`
+  （`LockAcquireTimeoutException` 子类），现有 `LockAcquireTimeoutException` 处理器无需改动。
 
 ## 构建
 

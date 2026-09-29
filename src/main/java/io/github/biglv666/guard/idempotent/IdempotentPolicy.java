@@ -105,6 +105,50 @@ public interface IdempotentPolicy {
     }
 
     /**
+     * 慢请求完成哨兵：占位已过期（令牌校验发现键不存在）时，
+     * 把本次结果写入短期哨兵键，供过期窗口内到达的重复请求重放。
+     *
+     * <p>仅当占位已过期（不是被其他请求接管）时才应写入；被接管时写入会造成结果串扰，
+     * 由默认策略在 Lua 脚本内区分两种情况。默认实现为空操作（不支持哨兵的策略安全降级为拒绝）。
+     *
+     * @param key     完整幂等键（与占位键相同）
+     * @param token   {@link #tryAcquireToken} 返回的令牌
+     * @param payload 序列化后的结果内容
+     * @param ttl     结果保持时长
+     * @throws Exception 实现自身故障时抛出；切面仅记录告警
+     * @since 0.2.1
+     */
+    default void saveResultIfExpired(String key, String token, String payload, Duration ttl) {
+        // 默认不支持哨兵：空实现，过期窗口内的重复请求退回拒绝
+    }
+
+    /**
+     * 查询慢请求完成哨兵中的结果。
+     *
+     * @param key 完整幂等键（与占位键相同）
+     * @return 哨兵中的序列化结果；无哨兵时返回 null
+     * @throws Exception 实现自身故障时抛出
+     * @since 0.2.1
+     */
+    default String loadExpiredResult(String key) {
+        return null;
+    }
+
+    /**
+     * 查询指定 key 占位的剩余有效时间（毫秒）。
+     *
+     * <p>用于拒绝异常中携带"还需等待多久"的提示。默认返回 -1 表示未知，
+     * 支持 TTL 查询的策略应覆写。
+     *
+     * @param key 完整幂等键（已含配置前缀）
+     * @return 剩余毫秒数；-1 表示未知或不支持
+     * @since 0.2.1
+     */
+    default long remainingTtlMillis(String key) {
+        return -1;
+    }
+
+    /**
      * 释放（回滚）指定 key 的幂等占位，用于业务方法异常后的重试放行。
      *
      * @param key 完整幂等键（已含配置前缀）
