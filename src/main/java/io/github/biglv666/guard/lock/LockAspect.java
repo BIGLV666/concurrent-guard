@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.core.annotation.Order;
 
 import java.lang.reflect.Method;
 import java.util.Map;
@@ -31,10 +32,14 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>锁获取失败统一按 THROW、SKIP、CUSTOM 策略处理，并在 finally 中安全释放已获取的锁。</p>
  *
+ * <p>切面顺序：{@code @Order(0)} 使本切面运行在事务拦截器（默认最低优先级）之外——
+ * 加锁在事务开始之前，解锁在事务提交之后，保证临界区完整覆盖事务生命周期。</p>
+ *
  * @author Guard Team
  * @since 0.1.0
  */
 @Aspect
+@Order(0)
 public class LockAspect {
 
     private static final Logger log = LoggerFactory.getLogger(LockAspect.class);

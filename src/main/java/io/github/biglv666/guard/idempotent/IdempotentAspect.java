@@ -13,6 +13,7 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.core.annotation.Order;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
@@ -37,10 +38,15 @@ import java.time.Duration;
  *
  * <p>拒绝与降级拒绝都会发布 {@link GuardRejectedEvent} 并累加 Micrometer 指标。
  *
+ * <p>切面顺序：{@code @Order(0)} 使本切面运行在事务拦截器（默认最低优先级）之外——
+ * 占位获取发生在事务开始之前，结果保存与占位释放发生在事务提交之后，
+ * 避免"事务回滚但重放已保存的结果"的窗口。依赖此顺序的行为请勿随意调整切面优先级。
+ *
  * @author Guard Team
  * @since 0.1.0
  */
 @Aspect
+@Order(0)
 public class IdempotentAspect {
 
     private static final Logger log = LoggerFactory.getLogger(IdempotentAspect.class);
@@ -50,6 +56,11 @@ public class IdempotentAspect {
      * 与"重放结果本身为 null"（void 方法）区分。
      */
     private static final Object REPLAY_NONE = new Object();
+
+    /**
+     * REPLAY 等待模式（{@code waitMillis > 0}）的重放轮询间隔（毫秒）。
+     */
+    private static final long REPLAY_POLL_INTERVAL_MILLIS = 50;
 
     private final IdempotentPolicyProvider policyProvider;
     private final ResultCodecProvider codecProvider;
@@ -88,11 +99,16 @@ public class IdempotentAspect {
         Duration ttl = Duration.ofMillis(idempotent.timeUnit().toMillis(idempotent.ttl()));
         IdempotentMode mode = idempotent.mode();
 
-        // 装配与配置校验：策略缺失、REPLAY 不支持、ttl 非法属于编程/配置错误，
+        // 装配与配置校验：策略缺失、REPLAY 不支持、ttl/waitMillis 非法属于编程/配置错误，
         // 必须在降级路径之外快速失败，避免被 fail-open 当作基础设施故障静默放行
         if (ttl.isZero() || ttl.isNegative()) {
             throw new IllegalStateException("@Idempotent 的 ttl 必须大于 0，当前配置: "
                     + idempotent.ttl() + " " + idempotent.timeUnit() + " - method: " + method.getName());
+        }
+        if (idempotent.waitMillis() < 0 || (idempotent.waitMillis() > 0 && mode != IdempotentMode.REPLAY)) {
+            throw new IllegalStateException("@Idempotent 的 waitMillis 仅支持 REPLAY 模式且不能为负，"
+                    + "当前配置: waitMillis=" + idempotent.waitMillis() + ", mode=" + mode
+                    + " - method: " + method.getName());
         }
         IdempotentPolicy policy = requirePolicy();
         ResultCodec codec = null;
@@ -114,18 +130,20 @@ public class IdempotentAspect {
 
         if (token == null) {
             if (mode == IdempotentMode.REPLAY) {
-                Object replayed = tryReplay(policy, codec, key, method);
+                Object replayed = replayWhileWaiting(policy, codec, key, method, idempotent.waitMillis());
                 if (replayed != REPLAY_NONE) {
                     return replayed;
                 }
             }
-            reject(policy, key, method, idempotent.message());
+            // reject 返回构建好的异常，调用点显式抛出：
+            // 编译器保证该分支必然终止，token 在后续代码中恒非 null
+            throw reject(policy, key, method, idempotent.message());
         }
 
-        // 占位成功但发现慢请求完成哨兵：前一个请求业务已完成、占位已过期，
-        // 本次直接重放哨兵结果并释放刚占的位，避免业务重复执行
+        // 占位成功但存在可重放结果（主键已过期、哨兵中有前一个请求的结果）：
+        // 直接重放并释放本次占位，避免业务重复执行
         if (mode == IdempotentMode.REPLAY) {
-            Object sentinelReplayed = tryReplaySentinel(policy, codec, key, method);
+            Object sentinelReplayed = replaySentinelQuietly(policy, codec, key, method);
             if (sentinelReplayed != REPLAY_NONE) {
                 releaseQuietly(policy, key, token, null);
                 return sentinelReplayed;
@@ -154,29 +172,50 @@ public class IdempotentAspect {
      *
      * @return 重放的返回值；无可重放结果时返回 {@link #REPLAY_NONE} 哨兵
      */
-    private Object tryReplay(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
-        String payload;
+    /**
+     * 重放查询中间结果。
+     * available=true 表示 payload 可进入反序列化；fatalFailure=true 表示查询故障
+     * （fail-close 降级已在本类型构造时发布，等待方应立即终止，避免事件/日志风暴）。
+     */
+    private record ReplayLookup(String payload, boolean available, boolean fatalFailure) {
+
+        static ReplayLookup found(String payload) {
+            return new ReplayLookup(payload, true, false);
+        }
+
+        static ReplayLookup notFound() {
+            return new ReplayLookup(null, false, false);
+        }
+
+        static ReplayLookup failed() {
+            return new ReplayLookup(null, false, true);
+        }
+    }
+
+    /**
+     * 单次重放查询：一次调用同时覆盖主键结果与慢请求完成哨兵
+     * （首个请求业务略超 TTL 时，过期窗口内仍允许重放而非拒绝）。
+     */
+    private ReplayLookup lookupReplay(IdempotentPolicy policy, String key, Method method) {
         try {
-            payload = policy.loadResult(key);
-            // 主占位读不到结果时，回查慢请求完成哨兵（首个请求业务略超 TTL、
-            // 占位已过期但结果刚写入哨兵的场景），过期窗口内仍允许重放而非拒绝
-            if (payload == null) {
-                payload = policy.loadExpiredResult(key);
-            }
+            String payload = policy.loadResultForReplay(key);
+            return payload != null ? ReplayLookup.found(payload) : ReplayLookup.notFound();
         } catch (Exception e) {
             log.warn("幂等结果重放查询故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
                     key, method.getName(), e.getMessage());
             publish(GuardEventType.IDEMPOTENT_DEGRADED, key, method, "结果重放查询故障，fail-close: " + e.getMessage());
             metrics.incrementRejected(GuardEventType.IDEMPOTENT_DEGRADED.name());
             metrics.incrementDegraded(GuardEventType.IDEMPOTENT_DEGRADED.name());
-            return REPLAY_NONE;
+            return ReplayLookup.failed();
         }
-        if (payload == null) {
-            // 首个请求仍在处理中（占位值还是处理中令牌），无结果可重放
-            return REPLAY_NONE;
-        }
+    }
+
+    /**
+     * 反序列化重放结果；失败按一致性优先拒绝该请求并发布降级事件，返回 {@link #REPLAY_NONE}。
+     */
+    private Object deserializeReplay(ReplayLookup lookup, ResultCodec codec, String key, Method method) {
         try {
-            Object replayed = codec.deserialize(payload, method.getGenericReturnType());
+            Object replayed = codec.deserialize(lookup.payload(), method.getGenericReturnType());
             metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
             return replayed;
         } catch (Exception e) {
@@ -189,16 +228,62 @@ public class IdempotentAspect {
         }
     }
 
+    private Object tryReplay(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
+        ReplayLookup lookup = lookupReplay(policy, key, method);
+        return lookup.available() ? deserializeReplay(lookup, codec, key, method) : REPLAY_NONE;
+    }
+
     /**
-     * 占位成功后回查慢请求完成哨兵：哨兵存在说明前一个请求业务已完成、
-     * 占位已过期，本次应重放其结果而非重复执行业务。
-     * 查询或反序列化失败按无哨兵处理（正常执行业务），不影响主链路可用性。
+     * 处理中重复请求的重放等待（{@code waitMillis > 0} 时启用）：
+     * 以固定 50ms 间隔轮询重放结果，直到拿到结果或超时。
+     * 查询故障或反序列化失败（基础设施/数据问题不会在毫秒级自愈）时立即终止等待，
+     * 避免故障期间以 50ms 间隔反复发布降级事件与告警日志；中断时恢复中断标记并终止。
+     *
+     * <p>注意：等待持有当前调用线程（servlet 场景占用请求线程），
+     * {@code waitMillis} 应配置为业务可接受的短暂窗口。
+     *
+     * @return 重放的返回值；超时/中断/故障/无结果时返回 {@link #REPLAY_NONE} 哨兵
+     */
+    private Object replayWhileWaiting(IdempotentPolicy policy, ResultCodec codec,
+                                      String key, Method method, long waitMillis) {
+        if (waitMillis <= 0) {
+            return tryReplay(policy, codec, key, method);
+        }
+        long deadline = System.currentTimeMillis() + waitMillis;
+        while (true) {
+            ReplayLookup lookup = lookupReplay(policy, key, method);
+            if (lookup.available()) {
+                return deserializeReplay(lookup, codec, key, method);
+            }
+            if (lookup.fatalFailure()) {
+                return REPLAY_NONE;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                log.info("幂等重放等待超时，拒绝请求 - key: {}, method: {}, waitMillis: {}",
+                        key, method.getName(), waitMillis);
+                return REPLAY_NONE;
+            }
+            try {
+                Thread.sleep(REPLAY_POLL_INTERVAL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("幂等重放等待被中断，拒绝请求 - key: {}, method: {}", key, method.getName());
+                return REPLAY_NONE;
+            }
+        }
+    }
+
+    /**
+     * 占位成功后的哨兵回查：主键上是本次自己的处理中令牌，
+     * {@code loadResultForReplay} 会跳过它并返回哨兵中的前一个请求结果
+     * （说明占位已过期、前一个业务已完成）。查询或反序列化失败按无哨兵处理
+     * （正常执行业务），不影响主链路可用性。
      *
      * @return 哨兵中的重放结果；无哨兵时返回 {@link #REPLAY_NONE} 哨兵
      */
-    private Object tryReplaySentinel(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
+    private Object replaySentinelQuietly(IdempotentPolicy policy, ResultCodec codec, String key, Method method) {
         try {
-            String payload = policy.loadExpiredResult(key);
+            String payload = policy.loadResultForReplay(key);
             if (payload == null) {
                 return REPLAY_NONE;
             }
@@ -213,18 +298,13 @@ public class IdempotentAspect {
     }
 
     /**
-     * 保存业务结果供重复请求重放。保存前校验占位归属（令牌不符时跳过写入，
-     * 避免覆盖其他请求的占位）；令牌不匹配且占位已过期时写入慢请求完成哨兵，
-     * 供过期窗口内到达的重复请求重放。保存失败仅记 warn：不影响业务返回值。
+     * 保存业务结果供重复请求重放。单次调用由策略按占位归属分流写入：
+     * 归属写主键、过期写哨兵、被接管不写。保存失败仅记 warn：不影响业务返回值。
      */
     private void saveResultQuietly(IdempotentPolicy policy, ResultCodec codec,
                                    String key, String token, Object result, Duration ttl) {
         try {
-            String payload = codec.serialize(result);
-            // 先按归属写主占位；未写入（过期或易主）再尝试过期哨兵——
-            // 哨兵仅覆盖"业务略超 TTL"的边界窗口，被他人接管时不写避免串扰
-            policy.saveResultIfOwned(key, token, payload, ttl);
-            policy.saveResultIfExpired(key, token, payload, ttl);
+            policy.saveResultForReplay(key, token, codec.serialize(result), ttl);
         } catch (Exception e) {
             log.warn("幂等结果保存失败，窗口内重复请求将退回拒绝行为 - key: {}, 错误: {}", key, e.getMessage());
         }
@@ -291,10 +371,11 @@ public class IdempotentAspect {
     }
 
     /**
-     * 拒绝重复请求：发布事件、累加指标并抛出携带注解消息与占位剩余 TTL 的异常。
+     * 构建拒绝重复请求的异常：发布事件、累加指标后返回携带注解消息与占位剩余 TTL 的异常，
+     * 由调用点显式抛出（保证该分支在类型层面必然终止）。
      * 剩余 TTL 查询失败不影响拒绝本身（降级为 -1 未知）。
      */
-    private void reject(IdempotentPolicy policy, String key, Method method, String message) throws IdempotentRejectedException {
+    private IdempotentRejectedException reject(IdempotentPolicy policy, String key, Method method, String message) {
         publish(GuardEventType.IDEMPOTENT_REJECTED, key, method, "TTL 窗口内重复请求");
         metrics.incrementRejected(GuardEventType.IDEMPOTENT_REJECTED.name());
         long remainingTtl;
@@ -303,7 +384,7 @@ public class IdempotentAspect {
         } catch (Exception e) {
             remainingTtl = -1;
         }
-        throw new IdempotentRejectedException(key, message, remainingTtl);
+        return new IdempotentRejectedException(key, message, remainingTtl);
     }
 
     /**

@@ -3,6 +3,7 @@ package io.github.biglv666.guard;
 import io.github.biglv666.guard.idempotent.IdempotentAspect;
 import io.github.biglv666.guard.idempotent.IdempotentPolicy;
 import io.github.biglv666.guard.idempotent.JacksonResultCodec;
+import io.github.biglv666.guard.idempotent.LocalIdempotentPolicy;
 import io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy;
 import io.github.biglv666.guard.idempotent.ResultCodec;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
@@ -35,9 +36,10 @@ import java.time.Duration;
  * <p>装配规则：
  * <ul>
  *   <li>{@code guard.enabled=false} 关闭一切；</li>
- *   <li>幂等模块：classpath 存在 Spring Data Redis 且 {@code guard.idempotent.enabled=true}
- *       时装配；默认策略 {@link RedisSetNxIdempotentPolicy} 可被用户注册的
- *       {@link IdempotentPolicy} Bean 覆盖；</li>
+ *   <li>幂等模块：{@code guard.idempotent.enabled=true} 时装配切面；
+ *       策略按 {@code guard.idempotent.store} 选择——{@code redis}（默认）需要
+ *       Spring Data Redis 与 StringRedisTemplate，{@code local} 用进程内策略（无 Redis 依赖）；
+ *       自定义 {@link IdempotentPolicy} Bean 可覆盖两者；</li>
  *   <li>锁模块：{@code guard.lock.enabled=true} 时装配，支持 Redis 锁与 JVM 本地锁；
  *       容器中缺少 {@link RedissonClient} 不影响本地锁，只有实际使用 Redis 锁时才抛出清晰配置错误。</li>
  * </ul>
@@ -69,11 +71,45 @@ public class GuardAutoConfiguration {
     }
 
     /**
-     * 幂等模块装配：仅当 classpath 存在 Spring Data Redis 时生效。
+     * 幂等模块装配：切面始终装配（本地策略不依赖 Redis）；
+     * 策略按 {@code guard.idempotent.store} 分流——local 装配进程内策略，
+     * redis（默认）走 {@link RedisIdempotentPolicyConfiguration}。
      */
-    @ConditionalOnClass(RedisOperations.class)
     @ConditionalOnProperty(prefix = "guard.idempotent", name = "enabled", havingValue = "true", matchIfMissing = true)
     static class IdempotentConfiguration {
+
+        /**
+         * 本地幂等策略（进程内占位，无跨进程互斥能力）：store=local 显式启用，
+         * 面向不依赖 Redis 的单实例部署。用户注册自定义 IdempotentPolicy Bean 时不装配。
+         */
+        @Bean
+        @ConditionalOnMissingBean(IdempotentPolicy.class)
+        @ConditionalOnProperty(prefix = "guard.idempotent", name = "store", havingValue = "local")
+        public IdempotentPolicy localIdempotentPolicy(GuardProperties guardProperties) {
+            GuardProperties.Idempotent props = guardProperties.getIdempotent();
+            return new LocalIdempotentPolicy(
+                    Duration.ofMillis(props.getReplayGraceMillis()), props.getLocalMaxEntries());
+        }
+
+        @Bean
+        public IdempotentAspect idempotentAspect(ObjectProvider<IdempotentPolicy> policyProvider,
+                                                 ObjectProvider<ResultCodec> codecProvider,
+                                                 SpelKeyResolver keyResolver,
+                                                 GuardProperties guardProperties,
+                                                 GuardMetrics guardMetrics,
+                                                 ApplicationEventPublisher eventPublisher) {
+            return new IdempotentAspect(policyProvider::getIfAvailable, codecProvider::getIfAvailable,
+                    keyResolver, guardProperties.getIdempotent(), guardMetrics, eventPublisher);
+        }
+    }
+
+    /**
+     * Redis 幂等策略装配：仅当 classpath 存在 Spring Data Redis、容器有
+     * StringRedisTemplate 且 store=redis（默认）时生效。
+     */
+    @ConditionalOnClass(RedisOperations.class)
+    @ConditionalOnProperty(prefix = "guard.idempotent", name = "store", havingValue = "redis", matchIfMissing = true)
+    static class RedisIdempotentPolicyConfiguration {
 
         /**
          * 默认幂等策略（Redis setnx + 令牌归属 + 慢请求完成哨兵）：
@@ -87,17 +123,6 @@ public class GuardAutoConfiguration {
                                                  GuardProperties guardProperties) {
             return new RedisSetNxIdempotentPolicy(redisTemplate,
                     Duration.ofMillis(guardProperties.getIdempotent().getReplayGraceMillis()));
-        }
-
-        @Bean
-        public IdempotentAspect idempotentAspect(ObjectProvider<IdempotentPolicy> policyProvider,
-                                                 ObjectProvider<ResultCodec> codecProvider,
-                                                 SpelKeyResolver keyResolver,
-                                                 GuardProperties guardProperties,
-                                                 GuardMetrics guardMetrics,
-                                                 ApplicationEventPublisher eventPublisher) {
-            return new IdempotentAspect(policyProvider::getIfAvailable, codecProvider::getIfAvailable,
-                    keyResolver, guardProperties.getIdempotent(), guardMetrics, eventPublisher);
         }
     }
 

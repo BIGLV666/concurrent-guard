@@ -72,6 +72,14 @@ public class GuardProperties {
         private boolean enabled = true;
 
         /**
+         * 幂等策略存储类型：
+         * {@code redis}（默认）= 使用 Redis 占位（多实例安全，要求 Redis 环境）；
+         * {@code local} = 使用进程内占位（单实例部署，不依赖 Redis，无跨进程互斥能力）。
+         * 注册了自定义 {@code IdempotentPolicy} Bean 时本配置不生效。
+         */
+        private String store = "redis";
+
+        /**
          * Redis 键前缀，最终键 = 前缀 + 注解 SpEL 解析值（或方法级默认键）。
          * 多应用共用同一 Redis 时可通过前缀隔离。
          */
@@ -89,11 +97,18 @@ public class GuardProperties {
 
         /**
          * 慢请求完成哨兵的保留时长（毫秒），默认 5000。
-         * REPLAY 模式下业务耗时略超占位 TTL 时，结果写入哨兵键供过期窗口内的
+         * REPLAY 模式下业务耗时略超占位 TTL 时，结果写入哨兵供过期窗口内的
          * 重复请求重放；超过该窗口则与"TTL 过期后重新执行"语义一致。
-         * 仅对默认 {@code RedisSetNxIdempotentPolicy} 生效，自定义策略按自身实现处理。
+         * 对默认 Redis 策略与本地策略均生效。
          */
         private long replayGraceMillis = 5000;
+
+        /**
+         * 本地策略的过期清理阈值（条目数）：{@code store=local} 时条目数超过该值
+         * 触发一次过期扫描。这是清理触发线而非硬上限，条目长期存活且持续增长
+         * 的场景应改用 Redis 策略。
+         */
+        private int localMaxEntries = 65536;
 
         public boolean isEnabled() {
             return enabled;
@@ -101,6 +116,14 @@ public class GuardProperties {
 
         public void setEnabled(boolean enabled) {
             this.enabled = enabled;
+        }
+
+        public String getStore() {
+            return store;
+        }
+
+        public void setStore(String store) {
+            this.store = store;
         }
 
         public String getKeyPrefix() {
@@ -125,6 +148,14 @@ public class GuardProperties {
 
         public void setReplayGraceMillis(long replayGraceMillis) {
             this.replayGraceMillis = replayGraceMillis;
+        }
+
+        public int getLocalMaxEntries() {
+            return localMaxEntries;
+        }
+
+        public void setLocalMaxEntries(int localMaxEntries) {
+            this.localMaxEntries = localMaxEntries;
         }
     }
 

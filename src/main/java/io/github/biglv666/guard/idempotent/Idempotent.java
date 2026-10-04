@@ -69,7 +69,15 @@ public @interface Idempotent {
      * 幂等模式：
      * {@link IdempotentMode#REJECT}（默认）= 重复请求直接拒绝；
      * {@link IdempotentMode#REPLAY} = 业务正常完成后，窗口内的重复请求重放首次的返回值
-     * （首次仍在处理中时仍拒绝；异常回滚行为不变）。
+     * （首次仍在处理中时按 {@link #waitMillis()} 处理；异常回滚行为不变）。
      */
     IdempotentMode mode() default IdempotentMode.REJECT;
+
+    /**
+     * REPLAY 模式下，首个请求仍在处理中时重复请求的最长等待毫秒数，默认 0（立即拒绝）。
+     * 大于 0 时以固定 50ms 间隔轮询重放结果，窗口内拿到首次结果则直接返回（不执行业务），
+     * 超时或被中断则拒绝。等待会持有当前调用线程（servlet 场景占用请求线程），
+     * 建议配置为业务可接受的短暂窗口；REJECT 模式下必须为 0，否则首次调用快速失败。
+     */
+    long waitMillis() default 0;
 }

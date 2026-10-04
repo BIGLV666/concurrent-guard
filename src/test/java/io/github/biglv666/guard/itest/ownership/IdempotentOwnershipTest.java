@@ -98,11 +98,11 @@ class IdempotentOwnershipTest {
         redisTemplate.opsForValue().set(key, foreign, TTL);
 
         // 先完成的慢请求保存结果不得覆盖新请求的占位（否则会导致结果串扰）
-        policy.saveResultIfOwned(key, mine, "{\"slow\":true}", TTL);
+        policy.saveResultForReplay(key, mine, "{\"slow\":true}", TTL);
         assertEquals(foreign, redisTemplate.opsForValue().get(key));
 
         // 令牌匹配时正常写入结果
-        policy.saveResultIfOwned(key, foreign, "{\"owner\":true}", TTL);
+        policy.saveResultForReplay(key, foreign, "{\"owner\":true}", TTL);
         assertEquals("{\"owner\":true}", redisTemplate.opsForValue().get(key));
     }
 
@@ -112,16 +112,16 @@ class IdempotentOwnershipTest {
         String token = policy.tryAcquireToken(key, TTL);
         assertNotNull(token);
         // 占位仍是处理中令牌：无结果可重放
-        assertNull(policy.loadResult(key));
+        assertNull(policy.loadResultForReplay(key));
 
         // 兼容旧版本写入的占位标记：同样视为处理中
         String legacyKey = "own-legacy-" + UUID.randomUUID();
         redisTemplate.opsForValue().set(legacyKey, "processing", TTL);
-        assertNull(policy.loadResult(legacyKey));
+        assertNull(policy.loadResultForReplay(legacyKey));
 
         // 令牌匹配后保存结果：可正常加载
-        policy.saveResultIfOwned(key, token, "payload", TTL);
-        assertEquals("payload", policy.loadResult(key));
+        policy.saveResultForReplay(key, token, "payload", TTL);
+        assertEquals("payload", policy.loadResultForReplay(key));
     }
 
     @Test
@@ -133,9 +133,9 @@ class IdempotentOwnershipTest {
         // 模拟占位过期（慢请求业务耗时略超 TTL）：键被删除
         redisTemplate.delete(key);
 
-        // 慢请求完成后写哨兵：过期窗口内的重复请求可重放结果
-        policy.saveResultIfExpired(key, token, "{\"expired\":true}", TTL);
-        assertEquals("{\"expired\":true}", policy.loadExpiredResult(key));
+        // 慢请求完成后保存：结果写入哨兵（保存与读取各一次往返）
+        policy.saveResultForReplay(key, token, "{\"expired\":true}", TTL);
+        assertEquals("{\"expired\":true}", policy.loadResultForReplay(key));
         // 主键上仍无占位（哨兵与主占位分离）
         assertNull(redisTemplate.opsForValue().get(key));
     }
@@ -150,8 +150,8 @@ class IdempotentOwnershipTest {
         redisTemplate.opsForValue().set(key, "__guard:processing__:foreign-" + UUID.randomUUID(), TTL);
 
         // 不写哨兵：避免旧请求的结果被新占位场景下的重复请求误重放
-        policy.saveResultIfExpired(key, token, "{\"stale\":true}", TTL);
-        assertNull(policy.loadExpiredResult(key));
+        policy.saveResultForReplay(key, token, "{\"stale\":true}", TTL);
+        assertNull(policy.loadResultForReplay(key));
     }
 
     @Test

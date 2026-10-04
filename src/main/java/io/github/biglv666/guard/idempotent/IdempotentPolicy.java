@@ -85,10 +85,17 @@ public interface IdempotentPolicy {
     }
 
     /**
-     * 校验占位归属后保存业务方法正常返回的结果，供窗口内的重复请求重放。
+     * 保存业务结果供窗口内重复请求重放（REPLAY 模式的标准写入路径）。
      *
-     * <p>仅当占位仍属于 {@code token} 对应的本次请求时才写入，避免 TTL 耗尽后
-     * 覆盖其他请求的占位造成结果串扰。默认实现委托到 {@link #saveResult}（无归属校验）。
+     * <p>实现应按占位归属决定写入位置：
+     * <ul>
+     *   <li>占位仍属于 {@code token} 对应的本次请求 → 覆盖写入主键（TTL 重设）；</li>
+     *   <li>占位已过期（键不存在）→ 写入短期哨兵（保留时长由实现决定，
+     *       建议不超过 {@code ttl} 与实现级宽限配置的较小值），供过期窗口内的
+     *       重复请求经 {@link #loadResultForReplay} 重放；</li>
+     *   <li>占位被其他请求接管（存在但令牌不同）→ 不写入，避免结果串扰。</li>
+     * </ul>
+     * 默认实现委托到 {@link #saveResult}（无归属校验，兼容旧实现）。
      *
      * <p>仅在 {@link #supportsReplay()} 为 true 时会被调用，且调用发生在
      * {@link #tryAcquireToken} 占位成功、业务方法正常返回之后。
@@ -100,38 +107,24 @@ public interface IdempotentPolicy {
      * @throws Exception 实现自身故障时抛出；切面仅记录告警，不影响业务返回值
      * @since 0.2.1
      */
-    default void saveResultIfOwned(String key, String token, String payload, Duration ttl) {
+    default void saveResultForReplay(String key, String token, String payload, Duration ttl) {
         saveResult(key, payload, ttl);
     }
 
     /**
-     * 慢请求完成哨兵：占位已过期（令牌校验发现键不存在）时，
-     * 把本次结果写入短期哨兵键，供过期窗口内到达的重复请求重放。
+     * 加载可重放的结果（REPLAY 模式的标准读取路径）。
      *
-     * <p>仅当占位已过期（不是被其他请求接管）时才应写入；被接管时写入会造成结果串扰，
-     * 由默认策略在 Lua 脚本内区分两种情况。默认实现为空操作（不支持哨兵的策略安全降级为拒绝）。
-     *
-     * @param key     完整幂等键（与占位键相同）
-     * @param token   {@link #tryAcquireToken} 返回的令牌
-     * @param payload 序列化后的结果内容
-     * @param ttl     结果保持时长
-     * @throws Exception 实现自身故障时抛出；切面仅记录告警
-     * @since 0.2.1
-     */
-    default void saveResultIfExpired(String key, String token, String payload, Duration ttl) {
-        // 默认不支持哨兵：空实现，过期窗口内的重复请求退回拒绝
-    }
-
-    /**
-     * 查询慢请求完成哨兵中的结果。
+     * <p>实现应依次尝试：主键上的已保存结果 → 慢请求完成哨兵中的结果；
+     * 两者都不可用（首个请求仍在处理中、或占位与结果均不存在）时返回 null。
+     * 默认实现委托到 {@link #loadResult}。
      *
      * @param key 完整幂等键（与占位键相同）
-     * @return 哨兵中的序列化结果；无哨兵时返回 null
-     * @throws Exception 实现自身故障时抛出
+     * @return 可重放的序列化结果；无可重放结果时返回 null
+     * @throws Exception 实现自身故障时抛出；切面统一按 fail-open/fail-close 语义降级
      * @since 0.2.1
      */
-    default String loadExpiredResult(String key) {
-        return null;
+    default String loadResultForReplay(String key) {
+        return loadResult(key);
     }
 
     /**
