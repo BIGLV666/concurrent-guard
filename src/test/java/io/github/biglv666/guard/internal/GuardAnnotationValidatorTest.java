@@ -62,6 +62,13 @@ class GuardAnnotationValidatorTest {
     }
 
     @Test
+    void asyncLockMethodFailsStartupWithGuidance() {
+        runner.withPropertyValues("guard.idempotent.enabled=false")
+                .withUserConfiguration(AsyncLockApp.class)
+                .run(context -> assertValidationFailure(context, "CompletionStage", "锁必须由获取线程释放"));
+    }
+
+    @Test
     void propertyTypoOnlyWarnsByDefault() {
         runner.withUserConfiguration(PropertyTypoApp.class).run(context ->
                 assertThat(context).hasNotFailed());
@@ -188,6 +195,21 @@ class GuardAnnotationValidatorTest {
             @DistributedLock(key = "#order.id", acquirePolicy = LockAcquirePolicy.SKIP)
             public int submit(Order order) {
                 return 1;
+            }
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class AsyncLockApp {
+        @Bean
+        Service service() {
+            return new Service();
+        }
+
+        static class Service {
+            @DistributedLock(key = "#order.id")
+            public java.util.concurrent.CompletableFuture<String> submit(Order order) {
+                return java.util.concurrent.CompletableFuture.completedFuture(order.getId());
             }
         }
     }

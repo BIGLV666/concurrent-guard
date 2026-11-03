@@ -98,11 +98,7 @@ public class SpelKeyResolver {
         Expression expression = expressionCache.computeIfAbsent(cacheKey, this::compile);
         Object[] actualArgs = args != null ? args : new Object[0];
         try {
-            SimpleEvaluationContext context = SimpleEvaluationContext.forReadOnlyDataBinding()
-                    .withInstanceMethods()
-                    .withRootObject(actualArgs)
-                    .build();
-            bindVariables(context, method, actualArgs);
+            SimpleEvaluationContext context = buildContext(method, actualArgs);
             Object value = expression.getValue(context);
             // 声明了表达式却求值出 null/空白（如入参业务 id 为 null）：属于数据或配置错误。
             // 若静默回退方法级默认键，会把"按业务 id 隔离"意外放大为"整个方法互斥"，造成无关请求被误拒，故快速失败。
@@ -121,6 +117,57 @@ public class SpelKeyResolver {
     }
 
     /**
+     * 求值布尔表达式，供 {@code @Idempotent(condition/unless)} 使用。
+     *
+     * @param method     被拦截的方法
+     * @param args       方法入参
+     * @param expression 布尔 SpEL；空白表达式返回 {@code defaultValue}
+     * @param result     业务返回值，绑定为 {@code #result}；条件表达式可传 null
+     * @param defaultValue 表达式为空白时的返回值
+     * @return 表达式求值结果
+     * @throws KeyResolveException 表达式编译或求值失败时抛出
+     * @since 0.3.0
+     */
+    public boolean evaluateBoolean(Method method, Object[] args, String expression,
+                                   Object result, boolean defaultValue) {
+        if (expression == null || expression.isBlank()) {
+            return defaultValue;
+        }
+        CacheKey cacheKey = new CacheKey(method, expression);
+        Expression compiled = expressionCache.computeIfAbsent(cacheKey, this::compile);
+        Object[] actualArgs = args != null ? args : new Object[0];
+        try {
+            SimpleEvaluationContext context = buildContext(method, actualArgs);
+            context.setVariable("result", result);
+            Object value = compiled.getValue(context);
+            if (value == null) {
+                return false;
+            }
+            if (value instanceof Boolean booleanValue) {
+                return booleanValue;
+            }
+            return Boolean.parseBoolean(String.valueOf(value));
+        } catch (KeyResolveException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new KeyResolveException("条件表达式求值失败 - method: " + method.getName()
+                    + ", expression: '" + expression + "'", e);
+        }
+    }
+
+    /**
+     * 构建求值上下文并绑定参数变量。
+     */
+    private SimpleEvaluationContext buildContext(Method method, Object[] actualArgs) {
+        SimpleEvaluationContext context = SimpleEvaluationContext.forReadOnlyDataBinding()
+                .withInstanceMethods()
+                .withRootObject(actualArgs)
+                .build();
+        bindVariables(context, method, actualArgs);
+        return context;
+    }
+
+    /**
      * 校验 key 表达式，供启动期扫描和业务方单元测试使用。
      *
      * @param method        被拦截的方法
@@ -129,6 +176,21 @@ public class SpelKeyResolver {
      * @return 错误与警告列表；语法错误会出现在 errors 中
      */
     public ValidationResult validate(Method method, String keyExpression, PropertyCheckMode mode) {
+        return validate(method, keyExpression, mode, Set.of());
+    }
+
+    /**
+     * 校验表达式，并允许额外变量（如 {@code #result} 用于 unless 表达式）。
+     *
+     * @param method         被拦截的方法
+     * @param keyExpression  表达式
+     * @param mode           属性/方法名检查级别
+     * @param extraVariables 除参数名、#pN/#aN、#root/#this 外额外允许的变量
+     * @return 校验结果
+     * @since 0.3.0
+     */
+    public ValidationResult validate(Method method, String keyExpression, PropertyCheckMode mode,
+                                    Set<String> extraVariables) {
         if (keyExpression == null || keyExpression.isBlank()) {
             return ValidationResult.empty();
         }
@@ -140,7 +202,8 @@ public class SpelKeyResolver {
         }
         List<String> errors = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
-        validateExpression(expression, method, mode != null ? mode : PropertyCheckMode.WARN, errors, warnings);
+        validateExpression(expression, method, mode != null ? mode : PropertyCheckMode.WARN,
+                extraVariables != null ? extraVariables : Set.of(), errors, warnings);
         return new ValidationResult(errors, warnings);
     }
 
@@ -169,12 +232,12 @@ public class SpelKeyResolver {
      * 遍历表达式 AST，收集校验问题。
      */
     private void validateExpression(Expression expression, Method method, PropertyCheckMode mode,
-                                    List<String> errors, List<String> warnings) {
+                                    Set<String> extraVariables, List<String> errors, List<String> warnings) {
         if (expression instanceof SpelExpression spelExpression) {
-            validateNode(spelExpression.getAST(), method, mode, errors, warnings);
+            validateNode(spelExpression.getAST(), method, mode, extraVariables, errors, warnings);
         } else if (expression instanceof CompositeStringExpression composite) {
             for (Expression part : composite.getExpressions()) {
-                validateExpression(part, method, mode, errors, warnings);
+                validateExpression(part, method, mode, extraVariables, errors, warnings);
             }
         }
     }
@@ -187,12 +250,12 @@ public class SpelKeyResolver {
      * 推断类型作为后一个节点的目标类型，否则属性检查拿不到 {@code #order} 的类型。</p>
      */
     private void validateNode(SpelNode node, Method method, PropertyCheckMode mode,
-                              List<String> errors, List<String> warnings) {
-        validateNode(node, method, mode, errors, warnings, null);
+                              Set<String> extraVariables, List<String> errors, List<String> warnings) {
+        validateNode(node, method, mode, extraVariables, errors, warnings, null);
     }
 
     private void validateNode(SpelNode node, Method method, PropertyCheckMode mode,
-                              List<String> errors, List<String> warnings,
+                              Set<String> extraVariables, List<String> errors, List<String> warnings,
                               ResolvableType targetType) {
         if (node == null) {
             return;
@@ -201,7 +264,7 @@ public class SpelKeyResolver {
             ResolvableType current = null;
             for (int i = 0; i < node.getChildCount(); i++) {
                 SpelNode child = node.getChild(i);
-                validateNode(child, method, mode, errors, warnings, current);
+                validateNode(child, method, mode, extraVariables, errors, warnings, current);
                 ResolvableType childType = inferType(child, method, current);
                 if (childType != null) {
                     current = childType;
@@ -210,7 +273,7 @@ public class SpelKeyResolver {
             return;
         }
         if (node instanceof VariableReference variable) {
-            validateVariable(variable.toStringAST().substring(1), method, errors);
+            validateVariable(variable.toStringAST().substring(1), method, extraVariables, errors);
         } else if (node instanceof TypeReference) {
             errors.add("不支持类型引用 T(...)：SimpleEvaluationContext 出于安全限制不开放类型/静态方法");
         } else if (node instanceof ConstructorReference) {
@@ -231,15 +294,19 @@ public class SpelKeyResolver {
             }
         }
         for (int i = 0; i < node.getChildCount(); i++) {
-            validateNode(node.getChild(i), method, mode, errors, warnings, null);
+            validateNode(node.getChild(i), method, mode, extraVariables, errors, warnings, null);
         }
     }
 
     /**
      * 校验变量名：允许参数名、#pN/#aN、#root、#this；位置变量越界单独报错。
      */
-    private void validateVariable(String name, Method method, List<String> errors) {
+    private void validateVariable(String name, Method method, Set<String> extraVariables,
+                                  List<String> errors) {
         if ("root".equals(name) || "this".equals(name)) {
+            return;
+        }
+        if (extraVariables != null && extraVariables.contains(name)) {
             return;
         }
         Integer index = positionalIndex(name);
@@ -254,7 +321,7 @@ public class SpelKeyResolver {
                 return;
             }
         }
-        errors.add("变量 #" + name + " 不存在；可用变量: " + availableVariables(method));
+        errors.add("变量 #" + name + " 不存在；可用变量: " + availableVariables(method, extraVariables));
     }
 
     /**
@@ -448,7 +515,7 @@ public class SpelKeyResolver {
         return names.isEmpty() ? "<unknown>" : String.join(", ", names);
     }
 
-    private String availableVariables(Method method) {
+    private String availableVariables(Method method, Set<String> extraVariables) {
         List<String> variables = new ArrayList<>();
         String[] names = parameterNames(method);
         if (names.length == 0) {
@@ -462,6 +529,9 @@ public class SpelKeyResolver {
         }
         variables.add("root");
         variables.add("this");
+        if (extraVariables != null) {
+            variables.addAll(extraVariables);
+        }
         return String.join(", ", variables);
     }
 

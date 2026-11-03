@@ -53,6 +53,13 @@ public class GuardProperties implements InitializingBean {
      */
     private final Validation validation = new Validation();
 
+    /**
+     * 兼容性开关。
+     *
+     * @since 0.3.0
+     */
+    private final Compat compat = new Compat();
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -71,6 +78,10 @@ public class GuardProperties implements InitializingBean {
 
     public Validation getValidation() {
         return validation;
+    }
+
+    public Compat getCompat() {
+        return compat;
     }
 
     /**
@@ -197,6 +208,31 @@ public class GuardProperties implements InitializingBean {
 
         public void setLocalMaxEntries(int localMaxEntries) {
             this.localMaxEntries = localMaxEntries;
+        }
+    }
+
+    /**
+     * 兼容性配置项。
+     *
+     * @since 0.3.0
+     */
+    public static class Compat {
+
+        /**
+         * 是否沿用 0.2.x 的方法级默认键 {@code 类名#方法名}。
+         *
+         * <p>0.3.0 起默认使用包含参数类型的格式，避免重载方法互撞。
+         * 滚动升级期间如需保持旧键（例如旧占位尚未过期），可临时设为 true，
+         * 待 TTL 窗口过去后恢复 false。</p>
+         */
+        private boolean legacyDefaultKey = false;
+
+        public boolean isLegacyDefaultKey() {
+            return legacyDefaultKey;
+        }
+
+        public void setLegacyDefaultKey(boolean legacyDefaultKey) {
+            this.legacyDefaultKey = legacyDefaultKey;
         }
     }
 

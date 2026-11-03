@@ -74,6 +74,30 @@ public @interface Idempotent {
     IdempotentMode mode() default IdempotentMode.REJECT;
 
     /**
+     * 前置条件 SpEL：表达式为空或求值为 true 时才执行幂等防护；
+     * 求值为 false 时直接执行业务方法，不占位、不拒绝、不保存重放结果。
+     *
+     * <p>示例：{@code condition = "#order.amount > 0"}。
+     * 表达式语法错误会在启动期校验中失败；运行期求值失败快速抛出
+     * {@code KeyResolveException}，不静默跳过防护。</p>
+     *
+     * @since 0.3.0
+     */
+    String condition() default "";
+
+    /**
+     * 后置排除 SpEL：业务成功返回后求值，可用 {@code #result} 引用返回值。
+     * 求值为 true 时释放本次占位且不保存 REPLAY 结果，使后续请求可以重新进入业务。
+     *
+     * <p>示例：{@code unless = "#result == null"} 或
+     * {@code unless = "#result.status == 'FAIL'"}。
+     * 求值失败只记录 warn，不影响已成功的业务返回值。</p>
+     *
+     * @since 0.3.0
+     */
+    String unless() default "";
+
+    /**
      * REPLAY 模式下，首个请求仍在处理中时重复请求的最长等待毫秒数，默认 0（立即拒绝）。
      * 大于 0 时以固定 50ms 间隔轮询重放结果，窗口内拿到首次结果则直接返回（不执行业务），
      * 超时或被中断则拒绝。等待会持有当前调用线程（servlet 场景占用请求线程），

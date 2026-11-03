@@ -20,6 +20,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.boot.actuate.health.HealthIndicator;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -90,6 +91,23 @@ public class GuardAutoConfiguration {
     }
 
     /**
+     * 健康检查：仅在宿主引入 actuator 时注册，展示配置/装配状态。
+     *
+     * @since 0.3.0
+     */
+    @ConditionalOnClass(HealthIndicator.class)
+    static class HealthConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        public GuardHealthIndicator guardHealthIndicator(ObjectProvider<IdempotentPolicy> policyProvider,
+                                                         ObjectProvider<LockExecutor> executorProvider,
+                                                         GuardProperties guardProperties) {
+            return new GuardHealthIndicator(policyProvider, executorProvider, guardProperties);
+        }
+    }
+
+    /**
      * 幂等模块装配：切面始终装配（本地策略不依赖 Redis）；
      * 策略按 {@code guard.idempotent.store} 分流——local 装配进程内策略，
      * redis（默认）走 {@link RedisIdempotentPolicyConfiguration}。
@@ -118,7 +136,8 @@ public class GuardAutoConfiguration {
                                                  GuardMetrics guardMetrics,
                                                  ApplicationEventPublisher eventPublisher) {
             return new IdempotentAspect(policyProvider::getIfAvailable, codecProvider::getIfAvailable,
-                    keyResolver, guardProperties.getIdempotent(), guardMetrics, eventPublisher);
+                    keyResolver, guardProperties.getIdempotent(), guardProperties.getCompat(),
+                    guardMetrics, eventPublisher);
         }
     }
 
@@ -186,7 +205,8 @@ public class GuardAutoConfiguration {
                                      GuardMetrics guardMetrics,
                                      ApplicationEventPublisher eventPublisher) {
             return new LockAspect(executorProvider.orderedStream().toList(), applicationContextProvider,
-                    keyResolver, guardProperties.getLock(), guardMetrics, eventPublisher);
+                    keyResolver, guardProperties.getLock(), guardProperties.getCompat(),
+                    guardMetrics, eventPublisher);
         }
 
         @Bean

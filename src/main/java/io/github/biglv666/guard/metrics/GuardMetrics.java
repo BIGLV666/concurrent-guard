@@ -65,6 +65,13 @@ public class GuardMetrics {
      */
     public static final String TTL_EXCEEDED_COUNTER = "guard_idempotent_ttl_exceeded_total";
 
+    /**
+     * Timer 名称：锁持有时长（从获取成功到释放）。
+     *
+     * @since 0.3.0
+     */
+    public static final String LOCK_HOLD_TIMER = "guard_lock_hold";
+
     private final MeterRegistry registry;
 
     public GuardMetrics(ObjectProvider<MeterRegistry> registryProvider) {
@@ -135,5 +142,19 @@ public class GuardMetrics {
             return;
         }
         registry.timer(LOCK_ACQUIRE_TIMER, "type", lockType).record(waitNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * 记录一次锁持有时长（从获取成功到释放）。
+     *
+     * @param lockType  锁类型名（{@code REDIS} / {@code SYNCHRONIZED}）
+     * @param holdNanos 持有时长（纳秒）
+     * @since 0.3.0
+     */
+    public void recordLockHold(String lockType, long holdNanos) {
+        if (registry == null) {
+            return;
+        }
+        registry.timer(LOCK_HOLD_TIMER, "type", lockType).record(holdNanos, TimeUnit.NANOSECONDS);
     }
 }

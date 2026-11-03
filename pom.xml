@@ -12,7 +12,7 @@
 
     <groupId>io.github.biglv666</groupId>
     <artifactId>guard-spring-boot-starter</artifactId>
-    <version>0.2.2-SNAPSHOT</version>
+    <version>0.3.0-SNAPSHOT</version>
     <name>Guard Spring Boot Starter</name>
     <description>轻量级并发防护 Spring Boot Starter：注解式幂等（防重复提交，支持异常回滚、结果重放与自定义策略）与注解式分布式锁（Redisson）。</description>
     <url>https://github.com/BIGLV666/concurrent-guard</url>
@@ -75,6 +75,13 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- 健康检查可选：宿主有 actuator 时自动注册 GuardHealthIndicator -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator</artifactId>
             <optional>true</optional>
         </dependency>
 

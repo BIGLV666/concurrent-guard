@@ -15,6 +15,9 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -174,6 +177,136 @@ public class LockTemplate {
     }
 
     /**
+     * 尝试加锁，超时返回 {@link Optional#empty()}，不抛超时异常。
+     * 中断仍抛 {@link LockAcquireInterruptedException}；基础设施故障仍按 fail-open/fail-close 处理。
+     *
+     * <p>注意：业务返回 null 与超时都会得到 empty，无法区分；需要区分时请使用带 onTimeout 的重载。</p>
+     *
+     * @since 0.3.0
+     */
+    public <T> Optional<T> tryWithLock(String key, Supplier<T> action) {
+        return tryWithLock(key, DEFAULT_WAIT_SECONDS, -1, TimeUnit.SECONDS, action);
+    }
+
+    /**
+     * 尝试加锁，超时返回 {@link Optional#empty()}。
+     *
+     * @since 0.3.0
+     */
+    public <T> Optional<T> tryWithLock(String key, long waitTime, long leaseTime,
+                                       TimeUnit unit, Supplier<T> action) {
+        return tryExecute(LockType.REDIS, key, waitTime, leaseTime, unit, action);
+    }
+
+    /**
+     * 尝试本地加锁，超时返回 {@link Optional#empty()}。
+     *
+     * @since 0.3.0
+     */
+    public <T> Optional<T> tryWithLocalLock(String key, Supplier<T> action) {
+        return tryExecute(LockType.SYNCHRONIZED, key, DEFAULT_WAIT_SECONDS, -1, TimeUnit.SECONDS, action);
+    }
+
+    /**
+     * 尝试本地加锁，超时返回 {@link Optional#empty()}。
+     *
+     * @since 0.3.0
+     */
+    public <T> Optional<T> tryWithLocalLock(String key, long waitTime, TimeUnit unit, Supplier<T> action) {
+        return tryExecute(LockType.SYNCHRONIZED, key, waitTime, -1, unit, action);
+    }
+
+    /**
+     * 支持受检异常的 Redis 锁执行。
+     *
+     * @since 0.3.0
+     */
+    public <T> T callWithLock(String key, long waitTime, long leaseTime,
+                              TimeUnit unit, Callable<T> action) throws Exception {
+        return call(LockType.REDIS, key, waitTime, leaseTime, unit, action);
+    }
+
+    /**
+     * 支持受检异常的本地锁执行。
+     *
+     * @since 0.3.0
+     */
+    public <T> T callWithLocalLock(String key, long waitTime, TimeUnit unit,
+                                   Callable<T> action) throws Exception {
+        return call(LockType.SYNCHRONIZED, key, waitTime, -1, unit, action);
+    }
+
+    /**
+     * 获取锁超时时执行回退逻辑，而不是抛异常。
+     *
+     * @since 0.3.0
+     */
+    public <T> T withLock(String key, long waitTime, long leaseTime, TimeUnit unit,
+                          Supplier<T> action, Supplier<T> onTimeout) {
+        return executeWithFallback(LockType.REDIS, key, waitTime, leaseTime, unit, action, onTimeout);
+    }
+
+    /**
+     * 本地锁获取超时时执行回退逻辑。
+     *
+     * @since 0.3.0
+     */
+    public <T> T withLocalLock(String key, long waitTime, TimeUnit unit,
+                               Supplier<T> action, Supplier<T> onTimeout) {
+        return executeWithFallback(LockType.SYNCHRONIZED, key, waitTime, -1, unit, action, onTimeout);
+    }
+
+    private <T> Optional<T> tryExecute(LockType lockType, String key, long waitTime, long leaseTime,
+                                       TimeUnit unit, Supplier<T> action) {
+        try {
+            return Optional.ofNullable(execute(lockType, key, waitTime, leaseTime, unit, action));
+        } catch (LockAcquireInterruptedException | LockAcquireFailureException e) {
+            throw e;
+        } catch (LockAcquireTimeoutException e) {
+            return Optional.empty();
+        }
+    }
+
+    private <T> T call(LockType lockType, String key, long waitTime, long leaseTime,
+                       TimeUnit unit, Callable<T> action) throws Exception {
+        try {
+            return execute(lockType, key, waitTime, leaseTime, unit, () -> {
+                try {
+                    return action.call();
+                } catch (Exception e) {
+                    throw new CheckedExceptionWrapper(e);
+                }
+            });
+        } catch (CheckedExceptionWrapper e) {
+            throw e.unwrap();
+        }
+    }
+
+    private <T> T executeWithFallback(LockType lockType, String key, long waitTime, long leaseTime,
+                                      TimeUnit unit, Supplier<T> action, Supplier<T> onTimeout) {
+        try {
+            return execute(lockType, key, waitTime, leaseTime, unit, action);
+        } catch (LockAcquireInterruptedException | LockAcquireFailureException e) {
+            throw e;
+        } catch (LockAcquireTimeoutException e) {
+            return onTimeout.get();
+        }
+    }
+
+    /**
+     * 受检异常包装器，仅在 callWithLock 内部穿过 Supplier 使用。
+     */
+    private static final class CheckedExceptionWrapper extends RuntimeException {
+        private CheckedExceptionWrapper(Exception cause) {
+            super(cause);
+        }
+
+        private Exception unwrap() {
+            return (Exception) getCause();
+        }
+    }
+
+    /**
      * 按锁类型执行加锁逻辑，并统一处理超时/中断上报与锁释放。
      */
     private <T> T execute(LockType lockType, String key, long waitTime, long leaseTime,
@@ -196,15 +329,31 @@ public class LockTemplate {
             return handleAcquireFailure(lockType, fullKey, action, e);
         }
         recordAcquire(lockType, handle.acquireNanos());
+        long holdStart = System.nanoTime();
         try {
-            return action.get();
-        } finally {
-            try {
-                handle.close();
-            } catch (RuntimeException e) {
-                // 释放异常不应覆盖业务异常或业务返回值
-                log.warn("锁释放异常 - key: {}", fullKey, e);
+            T result = action.get();
+            if (result instanceof CompletionStage<?>) {
+                throw new LockConfigurationException("LockTemplate 不支持返回 CompletionStage/CompletableFuture 的代码块："
+                        + "锁必须由获取线程释放，异步完成线程无法安全解锁 - key: " + fullKey);
             }
+            return result;
+        } finally {
+            if (metrics != null) {
+                metrics.recordLockHold(lockType.name(), System.nanoTime() - holdStart);
+            }
+            closeHandle(handle, fullKey);
+        }
+    }
+
+    private static void closeHandle(LockHandle handle, String fullKey) {
+        if (handle == null) {
+            return;
+        }
+        try {
+            handle.close();
+        } catch (RuntimeException e) {
+            // 释放异常不应覆盖业务异常或业务返回值
+            log.warn("锁释放异常 - key: {}", fullKey, e);
         }
     }
 

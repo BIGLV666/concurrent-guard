@@ -7,10 +7,12 @@
 
 ## 特性
 
-- **幂等** `@Idempotent`：Redis setnx + TTL 原子占位（令牌归属校验，回滚/保存不误伤他人占位）；业务异常默认回滚占位（允许重试）；REPLAY 模式支持 TTL 窗口重放、慢请求完成哨兵与可选等待模式；`store=local` 可切换进程内策略（无 Redis 依赖）；支持自定义 `IdempotentPolicy` 策略
+- **幂等** `@Idempotent`：Redis setnx + TTL 原子占位（令牌归属校验，回滚/保存不误伤他人占位）；业务异常默认回滚占位（允许重试）；REPLAY 模式支持 TTL 窗口重放、慢请求完成哨兵与可选等待模式；`condition`/`unless` 条件防护；异步 `CompletionStage` 完成后才保存/释放；`store=local` 可切换进程内策略（无 Redis 依赖）；支持自定义 `IdempotentPolicy` 策略
 - **锁** `@DistributedLock`：支持 `REDIS` 分布式锁与 `SYNCHRONIZED` JVM 本地锁；锁粒度由 SpEL key 决定；THROW / SKIP / CUSTOM 三种获取失败策略；另有支持 Lambda 代码块的程序化 `LockTemplate`
+- **默认 key 精确化**：0.3.0 起方法级默认键包含参数类型，重载方法不再互撞；`guard.compat.legacy-default-key=true` 可回退旧格式
 - **事件 SPI**：幂等拒绝、锁超时统一发布 `GuardRejectedEvent`（Spring ApplicationEvent），业务方订阅后自由接告警
-- **指标**：宿主有 Micrometer 时自动上报拒绝计数 `guard_rejected_total`、降级计数 `guard_degraded_total`、重放计数 `guard_replayed_total` 与锁获取耗时 `guard_lock_acquire`
+- **指标**：宿主有 Micrometer 时自动上报拒绝计数 `guard_rejected_total`、降级计数 `guard_degraded_total`、重放计数 `guard_replayed_total`、锁获取耗时 `guard_lock_acquire`、锁持有时长 `guard_lock_hold`
+- **健康检查**：宿主有 actuator 时自动注册 `GuardHealthIndicator`，展示幂等策略、锁执行器与降级配置
 - **快速失败 + 启动期校验**：key 的 SpEL 配置错误在启动阶段集中校验（语法/变量名/属性名/位置变量），
   默认一次性列出所有问题并阻止启动；首次调用仍保留兜底快速失败，不静默回退
 
@@ -20,7 +22,7 @@
 <dependency>
     <groupId>io.github.biglv666</groupId>
     <artifactId>guard-spring-boot-starter</artifactId>
-    <version>0.2.2</version>
+    <version>0.3.0</version>
 </dependency>
 ```
 
@@ -61,6 +63,38 @@ REPLAY 的 TTL 必须不小于业务最大耗时，否则占位过期后新请�
 超时或被中断则拒绝；等待会持有当前调用线程，建议配置为业务可接受的短暂窗口；仅 REPLAY 模式可用。
 自定义 `IdempotentPolicy` 需实现 `saveResult`/`loadResult` 并覆写 `supportsReplay()` 才能配合 REPLAY 使用，
 否则首次调用即抛出带修复指引的异常。
+
+### 条件幂等（condition / unless）
+
+```java
+// 只有 amount > 0 的请求才做幂等；false 时直接执行业务，不占位
+@Idempotent(key = "#order.orderId", condition = "#order.amount > 0")
+public Result submit(@RequestBody Order order) { ... }
+
+// 业务返回 null 或失败结果时不保留占位，允许后续请求重试
+@Idempotent(key = "#order.orderId", unless = "#result == null")
+public Result query(@RequestBody Order order) { ... }
+```
+
+- `condition` 在 key 解析/占位之前求值，false 时完全跳过幂等防护；
+- `unless` 在业务成功返回后求值，可用 `#result`；true 时释放占位且不保存 REPLAY 结果；
+- 表达式语法错误启动期即失败；`unless` 运行期求值失败只记 warn，不影响业务返回值。
+
+### 异步方法
+
+`@Idempotent` 支持返回 `CompletionStage` / `CompletableFuture` 的方法：占位保存、异常回滚、
+`unless` 判断都会等异步任务真正完成后执行，不会在方法返回 Future 时提前处理。
+
+```java
+@Idempotent(key = "#orderId", mode = IdempotentMode.REPLAY)
+public CompletableFuture<Result> submit(String orderId) {
+    return CompletableFuture.supplyAsync(() -> doSubmit(orderId));
+}
+```
+
+`@DistributedLock` **不支持**异步返回：Redisson/本地锁都要求由获取线程释放，
+异步完成线程无法安全解锁。启动期校验会直接报错，请在异步任务内部使用 `LockTemplate`，
+或改用幂等/其他并发控制方案。响应式 `Mono` / `Flux` 同样暂不支持。
 
 ### 分布式锁
 
@@ -118,6 +152,24 @@ Order order = lockTemplate.withLocalLock(
 ```
 
 `withLock` 是程序化 Redis 锁 API。Redis 锁的默认等待时间为 3 秒，`leaseTime = -1` 时使用 Redisson 看门狗续期。
+
+0.3.0 新增：
+
+```java
+// 超时返回 Optional.empty()，不抛异常
+Optional<Order> order = lockTemplate.tryWithLock("order:" + orderId, () -> loadOrder(orderId));
+
+// 支持受检异常
+Order order2 = lockTemplate.callWithLock("order:" + orderId, 3, -1, TimeUnit.SECONDS,
+        () -> loadOrderChecked(orderId));
+
+// 超时执行回退逻辑
+Order order3 = lockTemplate.withLock("order:" + orderId, 3, -1, TimeUnit.SECONDS,
+        () -> loadOrder(orderId), () -> cachedOrder(orderId));
+```
+
+`tryWithLock` / `callWithLock` / 回退重载同样有 `withLocalLock` / `tryWithLocalLock` / `callWithLocalLock` 版本。
+`LockTemplate` 的代码块如果返回 `CompletionStage` 会快速失败，原因与注解锁相同：锁必须由获取线程释放。
 
 ### SpEL key 校验
 
@@ -196,6 +248,28 @@ public void onGuardRejected(GuardRejectedEvent event) {
 | `guard_replayed_total` | Counter | `type=IDEMPOTENT_REPLAYED` | REPLAY 模式下重放首次结果的次数 |
 | `guard_lock_acquire` | Timer | `type`（`REDIS` / `SYNCHRONIZED`） | 成功获取锁的耗时分布（含等待，Prometheus 渲染为 `guard_lock_acquire_seconds_*`） |
 | `guard_idempotent_ttl_exceeded_total` | Counter | `type=IDEMPOTENT_TTL_EXCEEDED` | 业务耗时超过幂等 TTL 的次数（占位可能提前过期） |
+| `guard_lock_hold` | Timer | `type`（`REDIS` / `SYNCHRONIZED`） | 锁持有时长（从获取成功到释放） |
+
+### 健康检查（可选）
+
+宿主引入 actuator 时自动注册 `GuardHealthIndicator`，`/actuator/health` 会包含：
+
+```json
+{
+  "guard": {
+    "status": "UP",
+    "details": {
+      "idempotentStore": "redis",
+      "idempotentPolicy": "io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy",
+      "idempotentFailOpen": true,
+      "lockExecutors": ["SYNCHRONIZED", "REDIS"],
+      "lockFailOpen": false
+    }
+  }
+}
+```
+
+该指示器只反映配置/装配状态，不重复探测 Redis 连通性；Redis 连通性由 Spring Boot 自带的 Redis health contributor 负责。
 
 ### 拒绝异常的 HTTP 映射（可选）
 
@@ -229,6 +303,8 @@ public class GuardExceptionAdvice {
 ```yaml
 guard:
   enabled: true                 # 总开关
+  compat:
+    legacy-default-key: false   # true=沿用 0.2.x 的 类名#方法名 默认键（滚动升级临时使用）
   validation:
     enabled: true               # 启动期扫描注解/SpEL，默认开启
     fail-fast: true             # 发现错误时启动失败；false=只记 error 日志
@@ -271,6 +347,12 @@ guard:
 | `LockTemplate` 锁超时/中断 | 与注解切面一致：发布 `GuardRejectedEvent` 并计入 `guard_rejected_total` |
 | Redis 锁基础设施故障 | 按 `guard.lock.fail-open`：false（默认）拒绝并抛 `LockAcquireFailureException`；true 跳过加锁放行，发布 `LOCK_DEGRADED` 并计降级指标 |
 | 幂等业务耗时超过 TTL | 记录 warn 并累加 `guard_idempotent_ttl_exceeded_total`；建议增大 TTL 或检查慢业务 |
+| 重载方法未显式写 key | 0.3.0 默认键包含参数类型，不再互撞；`guard.compat.legacy-default-key=true` 可回退旧格式 |
+| `@Idempotent(condition=false)` | 跳过幂等防护，直接执行业务，不占位 |
+| `@Idempotent(unless=true)` | 业务成功后释放占位且不保存 REPLAY 结果，允许后续请求重试 |
+| 幂等方法返回 `CompletionStage` | 占位保存/异常回滚/unless 判断等异步完成后执行 |
+| 锁方法返回 `CompletionStage` | 启动期快速失败；锁必须由获取线程释放，请在异步任务内使用 `LockTemplate` |
+| `LockTemplate` 代码块返回 `CompletionStage` | 快速失败并释放锁，避免跨线程解锁 |
 | `leaseTime = -1`（默认） | Redis 锁使用 Redisson 看门狗自动续期，持锁至方法结束；本地锁忽略此属性 |
 | 锁等待被中断 | 恢复中断标记并抛 `LockAcquireInterruptedException`（`LockAcquireTimeoutException` 子类，现有异常处理器无需改动），与锁竞争超时区分 |
 | 锁释放 | Redis 锁在 finally 中校验当前线程持有后释放；本地锁在 finally 中释放并清理锁槽位 |
@@ -288,6 +370,19 @@ guard:
   `guard_degraded_total`；基于拒绝计数配置的告警规则不受影响。
 - **锁中断语义**：等待加锁被中断现在抛 `LockAcquireInterruptedException`
   （`LockAcquireTimeoutException` 子类），现有 `LockAcquireTimeoutException` 处理器无需改动。
+
+## 从 0.2.2 升级
+
+- **默认 key 变更（需要关注）**：方法级默认键从 `类名#方法名` 改为 `类名#方法名(参数类型)`，
+  修复重载方法互撞。滚动升级期间如旧占位尚未过期，可临时设置
+  `guard.compat.legacy-default-key=true`，等 TTL 窗口过去后恢复 `false`。
+- **异步幂等**：`@Idempotent` 支持 `CompletionStage`/`CompletableFuture`，结果保存与回滚
+  延迟到异步完成；REPLAY 重放会返回已完成的 Future。
+- **异步锁明确不支持**：`@DistributedLock` 返回 `CompletionStage` 会在启动期报错，
+  `LockTemplate` 代码块返回 `CompletionStage` 会在运行期快速失败；锁必须由获取线程释放。
+- **新增 LockTemplate API**：`tryWithLock`、`callWithLock`、超时回退重载，以及对应的本地锁版本。
+- **新增健康检查/指标**：actuator 存在时注册 `GuardHealthIndicator`；新增 `guard_lock_hold`。
+- **condition / unless**：新增幂等前置条件与后置排除表达式，`unless` 可用 `#result`。
 
 ## 从 0.2.1 升级
 

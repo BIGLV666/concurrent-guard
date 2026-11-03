@@ -14,10 +14,14 @@ import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.core.ResolvableType;
 import org.springframework.core.annotation.Order;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Type;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -68,6 +72,7 @@ public class IdempotentAspect {
     private final ResultCodecProvider codecProvider;
     private final SpelKeyResolver keyResolver;
     private final GuardProperties.Idempotent properties;
+    private final GuardProperties.Compat compat;
     private final GuardMetrics metrics;
     private final ApplicationEventPublisher eventPublisher;
 
@@ -75,12 +80,14 @@ public class IdempotentAspect {
                             ResultCodecProvider codecProvider,
                             SpelKeyResolver keyResolver,
                             GuardProperties.Idempotent properties,
+                            GuardProperties.Compat compat,
                             GuardMetrics metrics,
                             ApplicationEventPublisher eventPublisher) {
         this.policyProvider = policyProvider;
         this.codecProvider = codecProvider;
         this.keyResolver = keyResolver;
         this.properties = properties;
+        this.compat = compat;
         this.metrics = metrics;
         this.eventPublisher = eventPublisher;
     }
@@ -96,8 +103,16 @@ public class IdempotentAspect {
     @Around(value = "@annotation(idempotent)")
     public Object around(ProceedingJoinPoint pjp, Idempotent idempotent) throws Throwable {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
-        String spelKey = keyResolver.resolve(method, pjp.getArgs(), idempotent.key());
-        String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method);
+        Object[] args = pjp.getArgs();
+
+        // condition 在 key 解析和占位之前求值：false 时完全跳过幂等防护
+        if (!keyResolver.evaluateBoolean(method, args, idempotent.condition(), null, true)) {
+            return pjp.proceed();
+        }
+
+        String spelKey = keyResolver.resolve(method, args, idempotent.key());
+        String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method,
+                compat != null && compat.isLegacyDefaultKey());
         Duration ttl = Duration.ofMillis(idempotent.timeUnit().toMillis(idempotent.ttl()));
         IdempotentMode mode = idempotent.mode();
 
@@ -155,7 +170,17 @@ public class IdempotentAspect {
         try {
             long businessStart = System.nanoTime();
             Object result = pjp.proceed();
+            if (isCompletionStage(method) && result instanceof CompletionStage<?> stage) {
+                attachAsyncCompletion(stage, policy, codec, key, token, ttl, method, args,
+                        idempotent, mode, businessStart);
+                return result;
+            }
             warnIfTtlExceeded(businessStart, ttl, key, method);
+            if (unlessMatchesQuietly(method, args, idempotent.unless(), result)) {
+                // 后置排除：释放占位且不保存结果，让后续请求可以重新进入业务
+                releaseQuietly(policy, key, token, null);
+                return result;
+            }
             if (mode == IdempotentMode.REPLAY) {
                 saveResultQuietly(policy, codec, key, token, result, ttl);
             }
@@ -219,9 +244,9 @@ public class IdempotentAspect {
      */
     private Object deserializeReplay(ReplayLookup lookup, ResultCodec codec, String key, Method method) {
         try {
-            Object replayed = codec.deserialize(lookup.payload(), method.getGenericReturnType());
+            Object replayed = codec.deserialize(lookup.payload(), replayValueType(method));
             metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
-            return replayed;
+            return wrapAsyncReplay(method, replayed);
         } catch (Exception e) {
             log.warn("幂等重放结果反序列化失败，拒绝本次请求 - key: {}, method: {}, 错误: {}",
                     key, method.getName(), e.getMessage());
@@ -291,13 +316,93 @@ public class IdempotentAspect {
             if (payload == null) {
                 return REPLAY_NONE;
             }
-            Object replayed = codec.deserialize(payload, method.getGenericReturnType());
+            Object replayed = codec.deserialize(payload, replayValueType(method));
             metrics.incrementReplayed(GuardEventType.IDEMPOTENT_REPLAYED.name());
-            return replayed;
+            return wrapAsyncReplay(method, replayed);
         } catch (Exception e) {
             log.warn("慢请求完成哨兵查询/反序列化失败，按无哨兵继续执行业务 - key: {}, method: {}, 错误: {}",
                     key, method.getName(), e.getMessage());
             return REPLAY_NONE;
+        }
+    }
+
+    /**
+     * 异步结果挂接：业务返回 {@link CompletionStage} 时，占位保存/释放/unless 判断
+     * 必须等异步任务真正完成后执行，不能按方法返回时刻提前处理。
+     */
+    private void attachAsyncCompletion(CompletionStage<?> stage,
+                                       IdempotentPolicy policy,
+                                       ResultCodec codec,
+                                       String key,
+                                       String token,
+                                       Duration ttl,
+                                       Method method,
+                                       Object[] args,
+                                       Idempotent idempotent,
+                                       IdempotentMode mode,
+                                       long businessStart) {
+        stage.whenComplete((value, error) -> {
+            if (error != null) {
+                if (idempotent.rollbackOnException()) {
+                    releaseQuietly(policy, key, token, error);
+                }
+                return;
+            }
+            warnIfTtlExceeded(businessStart, ttl, key, method);
+            if (unlessMatchesQuietly(method, args, idempotent.unless(), value)) {
+                releaseQuietly(policy, key, token, null);
+                return;
+            }
+            if (mode == IdempotentMode.REPLAY) {
+                saveResultQuietly(policy, codec, key, token, value, ttl);
+            }
+        });
+    }
+
+    /**
+     * 方法返回类型是否为异步结果；仅对 CompletionStage/CompletableFuture 生效，
+     * 响应式 Mono/Flux 暂不支持。
+     */
+    private static boolean isCompletionStage(Method method) {
+        return CompletionStage.class.isAssignableFrom(method.getReturnType());
+    }
+
+    /**
+     * REPLAY 反序列化目标类型：异步方法应使用 CompletionStage 的泛型实参
+     * （如 {@code CompletableFuture<Order>} → Order），而不是 Future 本身。
+     */
+    private static Type replayValueType(Method method) {
+        if (!isCompletionStage(method)) {
+            return method.getGenericReturnType();
+        }
+        Type type = ResolvableType.forMethodReturnType(method).getGeneric(0).getType();
+        return type != null ? type : Object.class;
+    }
+
+    /**
+     * 把重放值包装成方法声明的异步返回类型。
+     */
+    private static Object wrapAsyncReplay(Method method, Object value) {
+        if (!isCompletionStage(method)) {
+            return value;
+        }
+        return CompletableFuture.completedFuture(value);
+    }
+
+    /**
+     * 求值 unless 表达式；表达式为空返回 false。求值失败只记录 warn 并按 false 处理，
+     * 避免配置/数据问题覆盖已经成功的业务返回值。
+     */
+    private boolean unlessMatchesQuietly(Method method, Object[] args, String unless, Object result) {
+        if (unless == null || unless.isBlank()) {
+            return false;
+        }
+        try {
+            return keyResolver.evaluateBoolean(method, args, unless, result, false);
+        } catch (Exception e) {
+            log.warn("幂等 unless 表达式求值失败，按 false 处理 - method: {}, unless: '{}', 错误: {}",
+                    method.getName(), unless, e.getMessage());
+            return false;
         }
     }
 

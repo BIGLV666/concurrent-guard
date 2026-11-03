@@ -27,6 +27,7 @@ class GuardMetricsTest {
         metrics.incrementReplayed("IDEMPOTENT_REPLAYED");
         metrics.incrementDegraded("IDEMPOTENT_DEGRADED");
         metrics.recordLockAcquire("REDIS", 1_500_000);
+        metrics.recordLockHold("REDIS", 2_000_000);
 
         assertEquals(2.0, registry.get(GuardMetrics.REJECTED_COUNTER).tag("type", "LOCK_TIMEOUT").counter().count());
         assertEquals(1.0, registry.get(GuardMetrics.REPLAYED_COUNTER).tag("type", "IDEMPOTENT_REPLAYED").counter().count());
@@ -34,6 +35,9 @@ class GuardMetricsTest {
         // 1.5ms 以纳秒记录，Prometheus 侧渲染为秒
         assertEquals(0.0015,
                 registry.get(GuardMetrics.LOCK_ACQUIRE_TIMER).tag("type", "REDIS").timer().totalTime(TimeUnit.SECONDS),
+                1e-9);
+        assertEquals(0.002,
+                registry.get(GuardMetrics.LOCK_HOLD_TIMER).tag("type", "REDIS").timer().totalTime(TimeUnit.SECONDS),
                 1e-9);
     }
 

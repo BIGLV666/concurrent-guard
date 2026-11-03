@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -52,6 +53,7 @@ public class LockAspect {
     private final ObjectProvider<ApplicationContext> applicationContextProvider;
     private final SpelKeyResolver keyResolver;
     private final GuardProperties.Lock properties;
+    private final GuardProperties.Compat compat;
     private final GuardMetrics metrics;
     private final ApplicationEventPublisher eventPublisher;
 
@@ -76,12 +78,14 @@ public class LockAspect {
                       ObjectProvider<ApplicationContext> applicationContextProvider,
                       SpelKeyResolver keyResolver,
                       GuardProperties.Lock properties,
+                      GuardProperties.Compat compat,
                       GuardMetrics metrics,
                       ApplicationEventPublisher eventPublisher) {
         this.executors = index(executors);
         this.applicationContextProvider = applicationContextProvider;
         this.keyResolver = keyResolver;
         this.properties = properties;
+        this.compat = compat;
         this.metrics = metrics;
         this.eventPublisher = eventPublisher;
     }
@@ -99,7 +103,7 @@ public class LockAspect {
                       GuardMetrics metrics,
                       ApplicationEventPublisher eventPublisher) {
         this(legacyExecutors(redissonProvider, new LocalLockManager()), applicationContextProvider,
-                keyResolver, properties, metrics, eventPublisher);
+                keyResolver, properties, new GuardProperties.Compat(), metrics, eventPublisher);
     }
 
     /**
@@ -116,7 +120,7 @@ public class LockAspect {
                       ApplicationEventPublisher eventPublisher,
                       LocalLockManager localLockManager) {
         this(legacyExecutors(redissonProvider, localLockManager), applicationContextProvider,
-                keyResolver, properties, metrics, eventPublisher);
+                keyResolver, properties, new GuardProperties.Compat(), metrics, eventPublisher);
     }
 
     /**
@@ -131,19 +135,27 @@ public class LockAspect {
     public Object around(ProceedingJoinPoint pjp, DistributedLock distributedLock) throws Throwable {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         String spelKey = keyResolver.resolve(method, pjp.getArgs(), distributedLock.key());
-        String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method);
+        String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method,
+                compat != null && compat.isLegacyDefaultKey());
         LockType lockType = distributedLock.type();
         LockExecutor executor = executors.get(lockType);
         if (executor == null) {
             throw new LockConfigurationException("未装配锁执行器: " + lockType
                     + " - 请检查 guard.lock.enabled 与 Redisson 依赖；本地锁请使用 type = LockType.SYNCHRONIZED");
         }
+        if (isCompletionStage(method)) {
+            throw new LockConfigurationException("@DistributedLock 不支持返回 CompletionStage/CompletableFuture 的方法："
+                    + "锁必须由获取线程释放，异步完成线程无法安全解锁 - method: " + method.getName()
+                    + "。请在异步任务内部使用 LockTemplate，或改用幂等/其他并发控制方案。");
+        }
 
         LockHandle handle = null;
+        long holdStart = 0L;
         try {
             try {
                 handle = executor.acquire(key, distributedLock.waitTime(),
                         distributedLock.leaseTime(), distributedLock.timeUnit());
+                holdStart = System.nanoTime();
             } catch (LockAcquireInterruptedException e) {
                 metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
                 publish(key, method, "锁等待被中断");
@@ -165,13 +177,28 @@ public class LockAspect {
             return pjp.proceed();
         } finally {
             if (handle != null) {
-                try {
-                    handle.close();
-                } catch (RuntimeException e) {
-                    // 释放异常不应覆盖业务异常或业务返回值
-                    log.warn("锁释放异常 - key: {}, method: {}", key, method.getName(), e);
-                }
+                metrics.recordLockHold(lockType.name(), System.nanoTime() - holdStart);
             }
+            closeHandle(handle, key, method);
+        }
+    }
+
+    /**
+     * 异步结果挂接：锁必须持有到 CompletionStage 真正完成，而不是方法返回时刻。
+     */
+    private static boolean isCompletionStage(Method method) {
+        return CompletionStage.class.isAssignableFrom(method.getReturnType());
+    }
+
+    private static void closeHandle(LockHandle handle, String key, Method method) {
+        if (handle == null) {
+            return;
+        }
+        try {
+            handle.close();
+        } catch (RuntimeException e) {
+            // 释放异常不应覆盖业务异常或业务返回值
+            log.warn("锁释放异常 - key: {}, method: {}", key, method.getName(), e);
         }
     }
 

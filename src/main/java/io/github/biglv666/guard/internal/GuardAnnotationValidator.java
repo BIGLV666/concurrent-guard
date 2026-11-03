@@ -155,6 +155,10 @@ public class GuardAnnotationValidator implements SmartInitializingSingleton {
             addWarning(warnings, method, "@Idempotent message 为空，拒绝时异常消息将缺少业务提示");
         }
         validateKey(method, "@Idempotent", idempotent.key(), mode, errors, warnings);
+        validateKey(method, "@Idempotent(condition)", idempotent.condition(), mode,
+                Set.of(), errors, warnings);
+        validateKey(method, "@Idempotent(unless)", idempotent.unless(), mode,
+                Set.of("result"), errors, warnings);
     }
 
     private void validateLock(Method method, DistributedLock lock,
@@ -175,21 +179,33 @@ public class GuardAnnotationValidator implements SmartInitializingSingleton {
             addError(errors, method, "@DistributedLock acquirePolicy=SKIP 不能用于基本类型返回值方法 "
                     + method.getReturnType().getName() + "（超时返回 null 会导致拆箱异常）");
         }
+        if (java.util.concurrent.CompletionStage.class.isAssignableFrom(method.getReturnType())) {
+            addError(errors, method, "@DistributedLock 不支持返回 CompletionStage/CompletableFuture 的方法："
+                    + "锁必须由获取线程释放，异步完成线程无法安全解锁；请在异步任务内部使用 LockTemplate "
+                    + "或改用幂等/其他并发控制方案");
+        }
         validateKey(method, "@DistributedLock", lock.key(), mode, errors, warnings);
     }
 
     private void validateKey(Method method, String annotation, String keyExpression,
                              SpelKeyResolver.PropertyCheckMode mode,
                              List<String> errors, List<String> warnings) {
+        validateKey(method, annotation, keyExpression, mode, Set.of(), errors, warnings);
+    }
+
+    private void validateKey(Method method, String annotation, String keyExpression,
+                             SpelKeyResolver.PropertyCheckMode mode, Set<String> extraVariables,
+                             List<String> errors, List<String> warnings) {
         if (keyExpression == null || keyExpression.isBlank()) {
             return;
         }
-        SpelKeyResolver.ValidationResult result = keyResolver.validate(method, keyExpression, mode);
+        SpelKeyResolver.ValidationResult result =
+                keyResolver.validate(method, keyExpression, mode, extraVariables);
         for (String error : result.errors()) {
-            addError(errors, method, annotation + " key 表达式: " + error);
+            addError(errors, method, annotation + " 表达式: " + error);
         }
         for (String warning : result.warnings()) {
-            addWarning(warnings, method, annotation + " key 表达式: " + warning);
+            addWarning(warnings, method, annotation + " 表达式: " + warning);
         }
     }
 
