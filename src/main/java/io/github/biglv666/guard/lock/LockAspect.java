@@ -3,6 +3,7 @@ package io.github.biglv666.guard.lock;
 import io.github.biglv666.guard.GuardProperties;
 import io.github.biglv666.guard.event.GuardEventType;
 import io.github.biglv666.guard.event.GuardRejectedEvent;
+import io.github.biglv666.guard.internal.GuardEventSupport;
 import io.github.biglv666.guard.internal.GuardKeyUtils;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
 import io.github.biglv666.guard.metrics.GuardMetrics;
@@ -10,7 +11,6 @@ import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
-import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,37 +20,40 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.annotation.Order;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * {@link DistributedLock} 的方法级切面。
  *
- * <p>根据注解的 {@link LockType} 选择 Redisson 分布式锁或当前 JVM 内的本地锁。
- * 本地锁不要求容器中存在 {@link RedissonClient}；Redis 客户端仅在实际执行 Redis 路径时懒获取。</p>
+ * <p>根据注解的 {@link LockType} 选择对应的 {@link LockExecutor}：
+ * {@link LockType#REDIS} 使用 Redisson 分布式锁，{@link LockType#SYNCHRONIZED} 使用当前 JVM 内的本地锁。
+ * 本地锁不要求 classpath 中存在 Redisson；Redis 客户端仅在实际执行 Redis 路径时懒获取。</p>
  *
  * <p>锁获取失败统一按 THROW、SKIP、CUSTOM 策略处理，并在 finally 中安全释放已获取的锁。</p>
  *
- * <p>切面顺序：{@code @Order(0)} 使本切面运行在事务拦截器（默认最低优先级）之外——
- * 加锁在事务开始之前，解锁在事务提交之后，保证临界区完整覆盖事务生命周期。</p>
+ * <p>切面顺序：{@code @Order(100)} 使本切面运行在事务拦截器（默认最低优先级）之外，
+ * 并位于 {@code @Idempotent} 切面（{@code @Order(0)}）之内——同一方法同时使用两种注解时，
+ * 先做幂等判定，再竞争锁。</p>
  *
  * @author Guard Team
  * @since 0.1.0
  */
 @Aspect
-@Order(0)
+@Order(100)
 public class LockAspect {
 
     private static final Logger log = LoggerFactory.getLogger(LockAspect.class);
 
-    private final ObjectProvider<RedissonClient> redissonProvider;
+    private final Map<LockType, LockExecutor> executors;
     private final ObjectProvider<ApplicationContext> applicationContextProvider;
     private final SpelKeyResolver keyResolver;
     private final GuardProperties.Lock properties;
     private final GuardMetrics metrics;
     private final ApplicationEventPublisher eventPublisher;
-    private final LocalLockManager localLockManager;
 
     /**
      * 自定义回退处理器的解析缓存：类型 -> 实例（优先容器 Bean，其次无参构造实例化）。
@@ -58,17 +61,53 @@ public class LockAspect {
     private final Map<Class<? extends LockAcquireFallbackHandler>, LockAcquireFallbackHandler> handlerCache =
             new ConcurrentHashMap<>();
 
-    /** 兼容旧版直接实例化方式。 */
+    /**
+     * 标准构造器：按 {@link LockType} 索引可用的锁执行器。
+     *
+     * @param executors                       锁执行器列表（至少包含本地锁执行器）
+     * @param applicationContextProvider      用于解析自定义回退处理器 Bean
+     * @param keyResolver                     SpEL key 解析器
+     * @param properties                      锁模块配置
+     * @param metrics                         指标上报器
+     * @param eventPublisher                  事件发布器
+     * @since 0.2.1
+     */
+    public LockAspect(List<LockExecutor> executors,
+                      ObjectProvider<ApplicationContext> applicationContextProvider,
+                      SpelKeyResolver keyResolver,
+                      GuardProperties.Lock properties,
+                      GuardMetrics metrics,
+                      ApplicationEventPublisher eventPublisher) {
+        this.executors = index(executors);
+        this.applicationContextProvider = applicationContextProvider;
+        this.keyResolver = keyResolver;
+        this.properties = properties;
+        this.metrics = metrics;
+        this.eventPublisher = eventPublisher;
+    }
+
+    /**
+     * 兼容旧版直接实例化方式。
+     *
+     * @deprecated 请使用接收 {@link LockExecutor} 列表的构造器；旧构造器依赖 Redisson 类型。
+     */
+    @Deprecated
     public LockAspect(ObjectProvider<RedissonClient> redissonProvider,
                       ObjectProvider<ApplicationContext> applicationContextProvider,
                       SpelKeyResolver keyResolver,
                       GuardProperties.Lock properties,
                       GuardMetrics metrics,
                       ApplicationEventPublisher eventPublisher) {
-        this(redissonProvider, applicationContextProvider, keyResolver, properties, metrics,
-                eventPublisher, new LocalLockManager());
+        this(legacyExecutors(redissonProvider, new LocalLockManager()), applicationContextProvider,
+                keyResolver, properties, metrics, eventPublisher);
     }
 
+    /**
+     * 兼容旧版直接实例化方式。
+     *
+     * @deprecated 请使用接收 {@link LockExecutor} 列表的构造器；旧构造器依赖 Redisson 类型。
+     */
+    @Deprecated
     public LockAspect(ObjectProvider<RedissonClient> redissonProvider,
                       ObjectProvider<ApplicationContext> applicationContextProvider,
                       SpelKeyResolver keyResolver,
@@ -76,13 +115,8 @@ public class LockAspect {
                       GuardMetrics metrics,
                       ApplicationEventPublisher eventPublisher,
                       LocalLockManager localLockManager) {
-        this.redissonProvider = redissonProvider;
-        this.applicationContextProvider = applicationContextProvider;
-        this.keyResolver = keyResolver;
-        this.properties = properties;
-        this.metrics = metrics;
-        this.eventPublisher = eventPublisher;
-        this.localLockManager = localLockManager;
+        this(legacyExecutors(redissonProvider, localLockManager), applicationContextProvider,
+                keyResolver, properties, metrics, eventPublisher);
     }
 
     /**
@@ -98,58 +132,46 @@ public class LockAspect {
         Method method = ((MethodSignature) pjp.getSignature()).getMethod();
         String spelKey = keyResolver.resolve(method, pjp.getArgs(), distributedLock.key());
         String key = GuardKeyUtils.fullKey(properties.getKeyPrefix(), spelKey, method);
-        LocalLockManager.Handle localHandle = null;
-        RLock redisLock = null;
-        boolean locked = false;
-        boolean interrupted = false;
-        long acquireStart = System.nanoTime();
+        LockType lockType = distributedLock.type();
+        LockExecutor executor = executors.get(lockType);
+        if (executor == null) {
+            throw new LockConfigurationException("未装配锁执行器: " + lockType
+                    + " - 请检查 guard.lock.enabled 与 Redisson 依赖；本地锁请使用 type = LockType.SYNCHRONIZED");
+        }
+
+        LockHandle handle = null;
         try {
-            if (distributedLock.type() == LockType.SYNCHRONIZED) {
-                localHandle = localLockManager.acquire(key);
-                try {
-                    locked = localHandle.lock().tryLock(distributedLock.waitTime(), distributedLock.timeUnit());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    interrupted = true;
-                    log.warn("本地锁等待被中断 - key: {}, method: {}", key, method.getName());
-                }
-            } else {
-                redisLock = requireClient().getLock(key);
-                try {
-                    locked = redisLock.tryLock(distributedLock.waitTime(), distributedLock.leaseTime(), distributedLock.timeUnit());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    interrupted = true;
-                    log.warn("Redis 锁等待被中断 - key: {}, method: {}", key, method.getName());
-                }
-            }
-            if (!locked) {
+            try {
+                handle = executor.acquire(key, distributedLock.waitTime(),
+                        distributedLock.leaseTime(), distributedLock.timeUnit());
+            } catch (LockAcquireInterruptedException e) {
                 metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
-                publish(key, method, interrupted ? "锁等待被中断" : "锁等待超时");
-                if (interrupted) {
-                    // 中断意味着调用方取消/线程关闭，与锁竞争超时语义不同：
-                    // 无论获取失败策略如何，都以中断异常终止（中断标记已在上方恢复）
-                    throw new LockAcquireInterruptedException(key,
-                            "获取锁等待被中断: " + key);
-                }
+                publish(key, method, "锁等待被中断");
+                // 中断意味着调用方取消/线程关闭，与锁竞争超时语义不同：
+                // 无论获取失败策略如何，都以中断异常终止（中断标记已由执行器恢复）
+                throw e;
+            } catch (LockAcquireTimeoutException e) {
+                metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
+                publish(key, method, "锁等待超时");
                 return handleTimeout(pjp, distributedLock, key, method);
+            } catch (LockConfigurationException e) {
+                // 配置错误不受 fail-open 影响
+                throw e;
+            } catch (RuntimeException e) {
+                return handleAcquireFailure(pjp, key, method, e);
             }
             // 成功获取（含等待时间）计入锁耗时分布；超时失败已计入拒绝指标，不重复记录
-            metrics.recordLockAcquire(distributedLock.type().name(), System.nanoTime() - acquireStart);
+            metrics.recordLockAcquire(lockType.name(), handle.acquireNanos());
             return pjp.proceed();
         } finally {
-            if (locked) {
-                if (distributedLock.type() == LockType.SYNCHRONIZED) {
-                    localHandle.lock().unlock();
-                } else if (redisLock != null) {
-                    try {
-                        if (redisLock.isHeldByCurrentThread()) redisLock.unlock();
-                    } catch (IllegalMonitorStateException e) {
-                        log.warn("锁释放异常（租期可能已过期被自动释放）- key: {}, method: {}", key, method.getName(), e);
-                    }
+            if (handle != null) {
+                try {
+                    handle.close();
+                } catch (RuntimeException e) {
+                    // 释放异常不应覆盖业务异常或业务返回值
+                    log.warn("锁释放异常 - key: {}, method: {}", key, method.getName(), e);
                 }
             }
-            if (localHandle != null) localHandle.close();
         }
     }
 
@@ -174,6 +196,29 @@ public class LockAspect {
     }
 
     /**
+     * 锁基础设施故障处理：按 {@code guard.lock.fail-open} 放行或拒绝。
+     * fail-open 会放弃互斥保证，只适合业务能容忍并发的场景。
+     */
+    private Object handleAcquireFailure(ProceedingJoinPoint pjp, String key, Method method,
+                                        RuntimeException cause) throws Throwable {
+        if (properties.isFailOpen()) {
+            log.warn("锁基础设施故障，fail-open 跳过加锁（本次不做互斥保护） - key: {}, method: {}, 错误: {}",
+                    key, method.getName(), cause.getMessage());
+            metrics.incrementDegraded(GuardEventType.LOCK_DEGRADED.name());
+            publish(GuardEventType.LOCK_DEGRADED, key, method,
+                    "锁基础设施故障，fail-open: " + cause.getMessage());
+            return pjp.proceed();
+        }
+        log.warn("锁基础设施故障，fail-close 拒绝 - key: {}, method: {}, 错误: {}",
+                key, method.getName(), cause.getMessage());
+        metrics.incrementRejected(GuardEventType.LOCK_DEGRADED.name());
+        metrics.incrementDegraded(GuardEventType.LOCK_DEGRADED.name());
+        publish(GuardEventType.LOCK_DEGRADED, key, method,
+                "锁基础设施故障，fail-close: " + cause.getMessage());
+        throw new LockAcquireFailureException(key, "获取锁失败（基础设施故障）: " + key, cause);
+    }
+
+    /**
      * 解析自定义回退处理器：优先取容器中的 Bean（可注入依赖），否则无参构造实例化；结果按类型缓存。
      * （key 为通配符泛型时 computeIfAbsent 会产生捕获不兼容，故用 get/putIfAbsent 两步写法）
      */
@@ -191,7 +236,8 @@ public class LockAspect {
      * 实际创建回退处理器：优先取容器中的 Bean，其次反射无参构造。
      */
     private LockAcquireFallbackHandler createHandler(Class<? extends LockAcquireFallbackHandler> handlerClass) {
-        ApplicationContext context = applicationContextProvider.getIfAvailable();
+        ApplicationContext context = applicationContextProvider != null
+                ? applicationContextProvider.getIfAvailable() : null;
         if (context != null) {
             Map<String, ? extends LockAcquireFallbackHandler> beans = context.getBeansOfType(handlerClass);
             if (!beans.isEmpty()) {
@@ -207,23 +253,37 @@ public class LockAspect {
     }
 
     private void publish(String key, Method method, String reason) {
-        if (eventPublisher != null) {
-            eventPublisher.publishEvent(new GuardRejectedEvent(GuardEventType.LOCK_TIMEOUT, key,
-                    method.getDeclaringClass().getName() + "#" + method.getName(), reason));
+        publish(GuardEventType.LOCK_TIMEOUT, key, method, reason);
+    }
+
+    private void publish(GuardEventType type, String key, Method method, String reason) {
+        GuardEventSupport.publish(eventPublisher, new GuardRejectedEvent(type, key,
+                method.getDeclaringClass().getName() + "#" + method.getName(), reason));
+    }
+
+    private static Map<LockType, LockExecutor> index(List<LockExecutor> executors) {
+        Map<LockType, LockExecutor> indexed = new EnumMap<>(LockType.class);
+        if (executors != null) {
+            for (LockExecutor executor : executors) {
+                if (executor != null && executor.type() != null) {
+                    indexed.put(executor.type(), executor);
+                }
+            }
         }
+        return indexed;
     }
 
     /**
-     * 懒获取 RedissonClient：功能启用但未配置时，在首次加锁处抛出清晰的配置错误。
+     * 旧构造器兼容：本地锁始终存在；仅当传入 Redisson 客户端提供者时才创建 Redis 执行器。
+     * 该分支在 classpath 无 Redisson 时不会被触发，因此本地锁仍可独立使用。
      */
-    private RedissonClient requireClient() {
-        RedissonClient client = redissonProvider.getIfAvailable();
-        if (client == null) {
-            throw new IllegalStateException(
-                    "检测到 @DistributedLock 注解，但容器中不存在 RedissonClient Bean。"
-                            + "请引入 redisson 依赖并注册 RedissonClient（或使用 redisson-spring-boot-starter）；"
-                            + "若暂不使用分布式锁，可配置 guard.lock.enabled=false。");
+    private static List<LockExecutor> legacyExecutors(ObjectProvider<RedissonClient> redissonProvider,
+                                                      LocalLockManager localLockManager) {
+        List<LockExecutor> executors = new ArrayList<>();
+        executors.add(new LocalLockExecutor(localLockManager != null ? localLockManager : new LocalLockManager()));
+        if (redissonProvider != null) {
+            executors.add(new RedissonLockExecutor(redissonProvider));
         }
-        return client;
+        return executors;
     }
 }

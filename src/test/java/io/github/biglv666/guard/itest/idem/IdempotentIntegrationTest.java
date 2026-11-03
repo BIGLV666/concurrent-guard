@@ -43,7 +43,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * @since 0.1.0
  */
 @Testcontainers
-@SpringBootTest(classes = IdempotentIntegrationTest.App.class)
+// 本测试包含 ttl=0 的运行时快速失败用例，关闭启动期校验以保留首次调用语义
+@SpringBootTest(classes = IdempotentIntegrationTest.App.class,
+        properties = "guard.validation.enabled=false")
 class IdempotentIntegrationTest {
 
     @Container

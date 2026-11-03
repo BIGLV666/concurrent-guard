@@ -6,15 +6,20 @@ import io.github.biglv666.guard.idempotent.JacksonResultCodec;
 import io.github.biglv666.guard.idempotent.LocalIdempotentPolicy;
 import io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy;
 import io.github.biglv666.guard.idempotent.ResultCodec;
+import io.github.biglv666.guard.internal.GuardAnnotationValidator;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
 import io.github.biglv666.guard.lock.LockAspect;
+import io.github.biglv666.guard.lock.LockExecutor;
 import io.github.biglv666.guard.lock.LockTemplate;
+import io.github.biglv666.guard.lock.LocalLockExecutor;
 import io.github.biglv666.guard.lock.LocalLockManager;
+import io.github.biglv666.guard.lock.RedissonLockExecutor;
 import io.github.biglv666.guard.metrics.GuardMetrics;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -59,6 +64,20 @@ public class GuardAutoConfiguration {
     @ConditionalOnMissingBean
     public SpelKeyResolver spelKeyResolver() {
         return new SpelKeyResolver();
+    }
+
+    /**
+     * 启动期注解/SpEL 校验器：单例初始化完成后扫描注解方法，
+     * 默认 fail-fast 一次性列出所有配置错误。
+     *
+     * @since 0.2.2
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public GuardAnnotationValidator guardAnnotationValidator(ConfigurableListableBeanFactory beanFactory,
+                                                             SpelKeyResolver keyResolver,
+                                                             GuardProperties guardProperties) {
+        return new GuardAnnotationValidator(beanFactory, keyResolver, guardProperties.getValidation());
     }
 
     /**
@@ -141,11 +160,10 @@ public class GuardAutoConfiguration {
     }
 
     /**
-     * 锁模块装配：本地锁不依赖 Redisson，Redis 客户端在实际使用 Redis 锁时懒获取。
+     * 本地锁模块装配：不依赖 Redisson，classpath 中没有 Redisson 时仍可正常使用。
      */
-    @ConditionalOnClass(RedissonClient.class)
     @ConditionalOnProperty(prefix = "guard.lock", name = "enabled", havingValue = "true", matchIfMissing = true)
-    static class LockConfiguration {
+    static class LocalLockConfiguration {
 
         @Bean
         @ConditionalOnMissingBean
@@ -154,23 +172,46 @@ public class GuardAutoConfiguration {
         }
 
         @Bean
-        public LockAspect lockAspect(ObjectProvider<RedissonClient> redissonProvider,
+        @ConditionalOnMissingBean
+        public LocalLockExecutor localLockExecutor(LocalLockManager localLockManager) {
+            return new LocalLockExecutor(localLockManager);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean
+        public LockAspect lockAspect(ObjectProvider<LockExecutor> executorProvider,
                                      ObjectProvider<ApplicationContext> applicationContextProvider,
                                      SpelKeyResolver keyResolver,
                                      GuardProperties guardProperties,
                                      GuardMetrics guardMetrics,
-                                     ApplicationEventPublisher eventPublisher,
-                                     LocalLockManager localLockManager) {
-            return new LockAspect(redissonProvider, applicationContextProvider, keyResolver,
-                    guardProperties.getLock(), guardMetrics, eventPublisher, localLockManager);
+                                     ApplicationEventPublisher eventPublisher) {
+            return new LockAspect(executorProvider.orderedStream().toList(), applicationContextProvider,
+                    keyResolver, guardProperties.getLock(), guardMetrics, eventPublisher);
         }
 
         @Bean
-        public LockTemplate lockTemplate(ObjectProvider<RedissonClient> redissonProvider,
+        @ConditionalOnMissingBean
+        public LockTemplate lockTemplate(ObjectProvider<LockExecutor> executorProvider,
                                          GuardProperties guardProperties,
-                                         LocalLockManager localLockManager,
-                                         GuardMetrics guardMetrics) {
-            return new LockTemplate(redissonProvider, guardProperties.getLock(), localLockManager, guardMetrics);
+                                         GuardMetrics guardMetrics,
+                                         ApplicationEventPublisher eventPublisher) {
+            return new LockTemplate(executorProvider.orderedStream().toList(),
+                    guardProperties.getLock(), guardMetrics, eventPublisher);
+        }
+    }
+
+    /**
+     * Redisson 分布式锁执行器装配：仅在 classpath 存在 Redisson 时生效。
+     * 与本地锁配置分离，保证无 Redisson 的部署仍可使用本地锁。
+     */
+    @ConditionalOnClass(RedissonClient.class)
+    @ConditionalOnProperty(prefix = "guard.lock", name = "enabled", havingValue = "true", matchIfMissing = true)
+    static class RedissonLockConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        public RedissonLockExecutor redissonLockExecutor(ObjectProvider<RedissonClient> redissonProvider) {
+            return new RedissonLockExecutor(redissonProvider);
         }
     }
 }

@@ -1,5 +1,6 @@
 package io.github.biglv666.guard;
 
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -28,7 +29,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @since 0.1.0
  */
 @ConfigurationProperties(prefix = "guard")
-public class GuardProperties {
+public class GuardProperties implements InitializingBean {
 
     /**
      * 总开关：为 false 时所有切面均不装配，等于未引入本 starter。
@@ -45,6 +46,13 @@ public class GuardProperties {
      */
     private final Lock lock = new Lock();
 
+    /**
+     * 启动期注解/SpEL 校验配置。
+     *
+     * @since 0.2.2
+     */
+    private final Validation validation = new Validation();
+
     public boolean isEnabled() {
         return enabled;
     }
@@ -59,6 +67,39 @@ public class GuardProperties {
 
     public Lock getLock() {
         return lock;
+    }
+
+    public Validation getValidation() {
+        return validation;
+    }
+
+    /**
+     * 启动期配置校验：非法值在容器启动时直接失败，避免运行期出现难以排查的行为。
+     *
+     * @throws IllegalStateException 配置非法时
+     * @since 0.2.2
+     */
+    @Override
+    public void afterPropertiesSet() {
+        String store = idempotent.getStore();
+        if (!"redis".equals(store) && !"local".equals(store)) {
+            throw new IllegalStateException("guard.idempotent.store 只能是 redis 或 local（小写），当前: "
+                    + store);
+        }
+        if (idempotent.getReplayGraceMillis() < 0) {
+            throw new IllegalStateException("guard.idempotent.replay-grace-millis 不能为负，当前: "
+                    + idempotent.getReplayGraceMillis());
+        }
+        if (idempotent.getLocalMaxEntries() <= 0) {
+            throw new IllegalStateException("guard.idempotent.local-max-entries 必须大于 0，当前: "
+                    + idempotent.getLocalMaxEntries());
+        }
+        if (idempotent.getKeyPrefix() == null) {
+            throw new IllegalStateException("guard.idempotent.key-prefix 不能为 null");
+        }
+        if (lock.getKeyPrefix() == null) {
+            throw new IllegalStateException("guard.lock.key-prefix 不能为 null");
+        }
     }
 
     /**
@@ -160,6 +201,62 @@ public class GuardProperties {
     }
 
     /**
+     * 启动期注解/SpEL 校验配置项。
+     *
+     * <p>校验在 Spring 容器单例初始化完成后执行一次，只影响启动阶段，不增加请求期开销。
+     * 默认对语法错误、变量名错误、注解属性组合错误快速失败；属性名拼写检查默认只告警，
+     * 避免泛型/动态代理场景误报。</p>
+     *
+     * @since 0.2.2
+     */
+    public static class Validation {
+
+        /**
+         * 是否启用启动期扫描校验，默认 true。
+         */
+        private boolean enabled = true;
+
+        /**
+         * 发现错误时是否阻止应用启动：
+         * true（默认）= 抛出 {@code GuardValidationException}；
+         * false = 只记录 error 日志，继续启动。
+         */
+        private boolean failFast = true;
+
+        /**
+         * 属性名拼写检查级别：
+         * {@code off} = 只校验语法和变量名；
+         * {@code warn}（默认）= 属性/方法名疑似写错时记录 warn，不阻断启动；
+         * {@code strict} = 属性/方法名找不到时视为错误（受 fail-fast 控制）。
+         */
+        private String propertyCheck = "warn";
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public boolean isFailFast() {
+            return failFast;
+        }
+
+        public void setFailFast(boolean failFast) {
+            this.failFast = failFast;
+        }
+
+        public String getPropertyCheck() {
+            return propertyCheck;
+        }
+
+        public void setPropertyCheck(String propertyCheck) {
+            this.propertyCheck = propertyCheck;
+        }
+    }
+
+    /**
      * 分布式锁模块配置项。
      */
     public static class Lock {
@@ -173,6 +270,18 @@ public class GuardProperties {
          * Redisson 键前缀，最终键 = 前缀 + 注解 SpEL 解析值（或方法级默认键）。
          */
         private String keyPrefix = "guard:lock:";
+
+        /**
+         * 锁基础设施故障时的降级策略：
+         * false（默认）= fail-close，拒绝请求并抛 {@code LockAcquireFailureException}；
+         * true = fail-open，跳过加锁直接执行业务并记录降级事件/指标。
+         *
+         * <p>注意：fail-open 会放弃互斥保证，只适合"可用性优先且业务能容忍并发"的场景；
+         * 配置错误（缺少执行器/RedissonClient、CUSTOM 未指定 handler）不受本开关影响。</p>
+         *
+         * @since 0.2.2
+         */
+        private boolean failOpen = false;
 
         public boolean isEnabled() {
             return enabled;
@@ -188,6 +297,14 @@ public class GuardProperties {
 
         public void setKeyPrefix(String keyPrefix) {
             this.keyPrefix = keyPrefix;
+        }
+
+        public boolean isFailOpen() {
+            return failOpen;
+        }
+
+        public void setFailOpen(boolean failOpen) {
+            this.failOpen = failOpen;
         }
     }
 }

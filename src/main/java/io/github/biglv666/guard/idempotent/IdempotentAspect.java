@@ -3,6 +3,7 @@ package io.github.biglv666.guard.idempotent;
 import io.github.biglv666.guard.GuardProperties;
 import io.github.biglv666.guard.event.GuardEventType;
 import io.github.biglv666.guard.event.GuardRejectedEvent;
+import io.github.biglv666.guard.internal.GuardEventSupport;
 import io.github.biglv666.guard.internal.GuardKeyUtils;
 import io.github.biglv666.guard.internal.SpelKeyResolver;
 import io.github.biglv666.guard.metrics.GuardMetrics;
@@ -17,6 +18,7 @@ import org.springframework.core.annotation.Order;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 幂等切面 —— {@code @Idempotent} 的核心实现。
@@ -151,7 +153,9 @@ public class IdempotentAspect {
         }
 
         try {
+            long businessStart = System.nanoTime();
             Object result = pjp.proceed();
+            warnIfTtlExceeded(businessStart, ttl, key, method);
             if (mode == IdempotentMode.REPLAY) {
                 saveResultQuietly(policy, codec, key, token, result, ttl);
             }
@@ -298,6 +302,20 @@ public class IdempotentAspect {
     }
 
     /**
+     * 业务耗时超过 TTL 时记录告警与指标：占位可能已在业务完成前过期，
+     * 窗口内新请求会重新进入业务，幂等窗口实际失效。
+     */
+    private void warnIfTtlExceeded(long businessStart, Duration ttl, String key, Method method) {
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - businessStart);
+        if (elapsedMillis > ttl.toMillis()) {
+            log.warn("幂等业务耗时超过 TTL，占位可能已过期（建议增大 ttl 或检查慢业务） - key: {}, method: {}, "
+                            + "耗时: {}ms, ttl: {}ms",
+                    key, method.getName(), elapsedMillis, ttl.toMillis());
+            metrics.incrementTtlExceeded(GuardEventType.IDEMPOTENT_TTL_EXCEEDED.name());
+        }
+    }
+
+    /**
      * 保存业务结果供重复请求重放。单次调用由策略按占位归属分流写入：
      * 归属写主键、过期写哨兵、被接管不写。保存失败仅记 warn：不影响业务返回值。
      */
@@ -404,10 +422,8 @@ public class IdempotentAspect {
     }
 
     private void publish(GuardEventType type, String key, Method method, String reason) {
-        if (eventPublisher != null) {
-            eventPublisher.publishEvent(new GuardRejectedEvent(type, key,
-                    method.getDeclaringClass().getName() + "#" + method.getName(), reason));
-        }
+        GuardEventSupport.publish(eventPublisher, new GuardRejectedEvent(type, key,
+                method.getDeclaringClass().getName() + "#" + method.getName(), reason));
     }
 
     /**

@@ -31,5 +31,20 @@ public enum GuardEventType {
     /**
      * 锁等待超时：获取分布式锁在 waitTime 内未成功，按注解策略处理。
      */
-    LOCK_TIMEOUT
+    LOCK_TIMEOUT,
+
+    /**
+     * 锁降级：锁基础设施故障（Redis 断连、命令超时等），按
+     * {@code guard.lock.fail-open} 放行或拒绝。
+     *
+     * @since 0.2.2
+     */
+    LOCK_DEGRADED,
+
+    /**
+     * 幂等业务耗时超过 TTL。仅用于指标 tag 与日志，不发布拒绝事件。
+     *
+     * @since 0.2.2
+     */
+    IDEMPOTENT_TTL_EXCEEDED
 }

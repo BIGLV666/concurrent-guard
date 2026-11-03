@@ -39,7 +39,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * @since 0.2.0
  */
 @Testcontainers
-@SpringBootTest(classes = IdempotentReplayIntegrationTest.App.class)
+// 本测试包含 REJECT + waitMillis 的运行时快速失败用例，关闭启动期校验以保留首次调用语义
+@SpringBootTest(classes = IdempotentReplayIntegrationTest.App.class,
+        properties = "guard.validation.enabled=false")
 class IdempotentReplayIntegrationTest {
 
     @Container

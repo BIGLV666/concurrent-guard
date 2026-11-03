@@ -11,7 +11,8 @@
 - **锁** `@DistributedLock`：支持 `REDIS` 分布式锁与 `SYNCHRONIZED` JVM 本地锁；锁粒度由 SpEL key 决定；THROW / SKIP / CUSTOM 三种获取失败策略；另有支持 Lambda 代码块的程序化 `LockTemplate`
 - **事件 SPI**：幂等拒绝、锁超时统一发布 `GuardRejectedEvent`（Spring ApplicationEvent），业务方订阅后自由接告警
 - **指标**：宿主有 Micrometer 时自动上报拒绝计数 `guard_rejected_total`、降级计数 `guard_degraded_total`、重放计数 `guard_replayed_total` 与锁获取耗时 `guard_lock_acquire`
-- **快速失败**：key 的 SpEL 配置错误在首次调用即抛清晰异常，不静默回退
+- **快速失败 + 启动期校验**：key 的 SpEL 配置错误在启动阶段集中校验（语法/变量名/属性名/位置变量），
+  默认一次性列出所有问题并阻止启动；首次调用仍保留兜底快速失败，不静默回退
 
 ## 快速开始
 
@@ -19,7 +20,7 @@
 <dependency>
     <groupId>io.github.biglv666</groupId>
     <artifactId>guard-spring-boot-starter</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.2</version>
 </dependency>
 ```
 
@@ -118,6 +119,54 @@ Order order = lockTemplate.withLocalLock(
 
 `withLock` 是程序化 Redis 锁 API。Redis 锁的默认等待时间为 3 秒，`leaseTime = -1` 时使用 Redisson 看门狗续期。
 
+### SpEL key 校验
+
+`@Idempotent` / `@DistributedLock` 的 key 是字符串表达式，写错时过去只能在首次调用时暴露。
+0.2.2 起默认在应用启动阶段扫描所有 Bean 的注解方法并集中校验：
+
+```yaml
+guard:
+  validation:
+    enabled: true          # 默认开启启动期扫描
+    fail-fast: true        # true=启动失败；false=只记 error 日志
+    property-check: warn   # off / warn / strict
+```
+
+可发现的问题：
+
+- 表达式语法错误；
+- 变量名拼写错误（错误信息会列出可用变量）；
+- `#p0` / `#a0` 位置变量越界；
+- `T(...)` 类型引用、`new ...` 构造器（`SimpleEvaluationContext` 安全限制）；
+- 属性/方法名拼写（`warn` 只告警，`strict` 视为错误）；
+- `ttl <= 0`、`waitMillis` 用于 REJECT、`CUSTOM` 未指定 handler、
+  `SKIP` 用于基本类型返回值等注解属性组合问题。
+
+错误会一次性聚合，示例：
+
+```text
+Guard 注解校验失败，共 2 处：
+1. com.foo.OrderService#submit(Order) -> @Idempotent key 表达式: 变量 #oder 不存在；可用变量: order, p0, a0, root
+2. com.foo.StockService#deduct(Long) -> @DistributedLock key 表达式: 变量 #skuId 不存在；可用变量: sku, p0, a0, root
+```
+
+也可以在业务方单测中直接校验，无需启动 Spring：
+
+```java
+SpelKeyResolver resolver = new SpelKeyResolver();
+SpelKeyResolver.ValidationResult result =
+        resolver.validate(OrderService.class.getMethod("submit", Order.class), "#order.id");
+assertFalse(result.hasIssues());
+```
+
+SpEL 上下文支持：
+
+- 方法参数名（要求编译期 `-parameters`，Spring Boot 默认开启）；
+- `#p0` / `#a0` 位置别名；
+- `#root` / `#this`；
+- 实例方法调用（如 `#order.getId()`）；
+- 仍不开放 `T(...)`、静态方法和构造器，避免表达式注入。
+
 ### 自定义幂等策略
 
 ```java
@@ -146,6 +195,7 @@ public void onGuardRejected(GuardRejectedEvent event) {
 | `guard_degraded_total` | Counter | `type=IDEMPOTENT_DEGRADED` | 策略故障降级次数（fail-open 放行与 fail-close 拒绝都计入；放行不计入 `guard_rejected_total`） |
 | `guard_replayed_total` | Counter | `type=IDEMPOTENT_REPLAYED` | REPLAY 模式下重放首次结果的次数 |
 | `guard_lock_acquire` | Timer | `type`（`REDIS` / `SYNCHRONIZED`） | 成功获取锁的耗时分布（含等待，Prometheus 渲染为 `guard_lock_acquire_seconds_*`） |
+| `guard_idempotent_ttl_exceeded_total` | Counter | `type=IDEMPOTENT_TTL_EXCEEDED` | 业务耗时超过幂等 TTL 的次数（占位可能提前过期） |
 
 ### 拒绝异常的 HTTP 映射（可选）
 
@@ -179,6 +229,10 @@ public class GuardExceptionAdvice {
 ```yaml
 guard:
   enabled: true                 # 总开关
+  validation:
+    enabled: true               # 启动期扫描注解/SpEL，默认开启
+    fail-fast: true             # 发现错误时启动失败；false=只记 error 日志
+    property-check: warn        # off / warn / strict
   idempotent:
     enabled: true
     store: redis                # redis（默认）= Redis 占位；local = 进程内占位（单实例，无 Redis 依赖）
@@ -186,11 +240,11 @@ guard:
     fail-open: true             # Redis 故障时 true=放行（可用性优先）false=拒绝（一致性优先）
                                 # 注意：配置错误（无策略 Bean / REPLAY 不支持 / ttl 非法）不受 fail-open 影响，一律快速失败
     replay-grace-millis: 5000   # REPLAY 慢请求完成哨兵保留时长（Redis 与本地策略均生效）
-    local:
-      max-entries: 65536        # 本地策略过期清理阈值（非硬上限，仅 store=local 生效）
+    local-max-entries: 65536    # 本地策略过期清理阈值（非硬上限，仅 store=local 生效）
   lock:
     enabled: true
     key-prefix: "guard:lock:"
+    fail-open: false            # 锁基础设施故障时 false=拒绝（默认），true=跳过加锁放行
 ```
 
 ## 行为约定
@@ -202,7 +256,7 @@ guard:
 | Redis 故障（幂等） | 按 `fail-open` 放行或拒绝，不抛基础设施异常；降级计入 `guard_degraded_total` |
 | key 表达式求值为 null/空白 | 快速失败抛 `KeyResolveException`（0.1.0 行为：静默回退方法级默认键，会导致防护粒度意外变粗） |
 | `@Idempotent` 配置错误（ttl ≤ 0、waitMillis 负值或用于 REJECT、无策略 Bean、REPLAY 不支持等） | 首次调用抛带修复指引的 `IllegalStateException`，不进降级、不被 fail-open 吞掉 |
-| `store = local` | 进程内占位（单实例部署，无跨进程互斥能力），幂等/REPLAY/哨兵/剩余 TTL 语义与 Redis 策略对齐；条目数超过 `local.max-entries` 触发过期扫描 |
+| `store = local` | 进程内占位（单实例部署，无跨进程互斥能力），幂等/REPLAY/哨兵/剩余 TTL 语义与 Redis 策略对齐；条目数超过 `local-max-entries` 触发过期扫描 |
 | REPLAY 模式，重复请求且业务已完成 | 直接返回首次结果，不执行业务方法 |
 | REPLAY 模式，首个请求仍在处理中 | 重复请求按拒绝处理（不等待）；`waitMillis > 0` 时在等待窗口内每 50ms 轮询重放结果，超时或被中断则拒绝 |
 | REPLAY 模式，TTL 小于业务最大耗时 | 占位过期后新请求可重新进入业务（幂等窗口失效，业务可能重复执行）；结果保存带令牌校验，不会覆盖串扰；业务略超 TTL 时结果写入短期哨兵键，过期窗口内重复请求仍可重放 |
@@ -211,6 +265,12 @@ guard:
 | REPLAY 模式，结果保存/反序列化失败 | 保存失败退回拒绝行为并记 warn；反序列化失败拒绝请求并发布降级事件 |
 | REPLAY 模式，策略不支持重放 / 无 `ResultCodec` | 首次调用前抛出带修复指引的 `IllegalStateException` |
 | 容器无 `IdempotentPolicy` / `RedissonClient` Bean | 本地锁可正常使用；Redis 功能在首次实际调用时抛出带修复指引的异常（幂等侧即使 fail-open 也不放行） |
+| classpath 无 Redisson | 本地锁模块仍正常装配；Redis 锁调用在首次使用时提示缺少执行器/RedissonClient |
+| 启动期注解/SpEL 校验 | 默认 fail-fast，一次性列出所有错误；`guard.validation.enabled=false` 可关闭，`fail-fast=false` 只记日志 |
+| 事件监听器抛异常 | 只记 warn，不覆盖 Guard 拒绝异常，也不影响业务返回值 |
+| `LockTemplate` 锁超时/中断 | 与注解切面一致：发布 `GuardRejectedEvent` 并计入 `guard_rejected_total` |
+| Redis 锁基础设施故障 | 按 `guard.lock.fail-open`：false（默认）拒绝并抛 `LockAcquireFailureException`；true 跳过加锁放行，发布 `LOCK_DEGRADED` 并计降级指标 |
+| 幂等业务耗时超过 TTL | 记录 warn 并累加 `guard_idempotent_ttl_exceeded_total`；建议增大 TTL 或检查慢业务 |
 | `leaseTime = -1`（默认） | Redis 锁使用 Redisson 看门狗自动续期，持锁至方法结束；本地锁忽略此属性 |
 | 锁等待被中断 | 恢复中断标记并抛 `LockAcquireInterruptedException`（`LockAcquireTimeoutException` 子类，现有异常处理器无需改动），与锁竞争超时区分 |
 | 锁释放 | Redis 锁在 finally 中校验当前线程持有后释放；本地锁在 finally 中释放并清理锁槽位 |
@@ -229,6 +289,22 @@ guard:
 - **锁中断语义**：等待加锁被中断现在抛 `LockAcquireInterruptedException`
   （`LockAcquireTimeoutException` 子类），现有 `LockAcquireTimeoutException` 处理器无需改动。
 
+## 从 0.2.1 升级
+
+- **新增启动期校验，默认 fail-fast**：SpEL 语法错误、变量名错误、非法注解属性组合会在启动时
+  一次性报出。若存量项目暂时无法修复，可先设置 `guard.validation.fail-fast=false`（只记日志）
+  或 `guard.validation.enabled=false`（关闭扫描），修复后再恢复默认。
+- **本地锁不再要求 Redisson 在 classpath**：锁模块拆分为本地锁与 Redisson 锁两个装配单元；
+  仅使用 `LockType.SYNCHRONIZED` / `withLocalLock` 的部署可以不引入 Redisson。
+- **`LockTemplate` 拒绝上报对齐切面**：程序化加锁超时/中断现在也会发布事件并计入拒绝指标。
+- **事件监听器隔离**：监听器异常不再覆盖 Guard 拒绝异常；告警逻辑故障请查看 warn 日志。
+- **新增锁故障降级开关**：`guard.lock.fail-open` 默认 `false`（fail-close）；开启后 Redis 锁
+  基础设施故障会跳过加锁放行，并发布 `LOCK_DEGRADED`、计入降级指标。
+- **新增 TTL 超时观测**：业务耗时超过幂等 TTL 时记录 warn 并累加
+  `guard_idempotent_ttl_exceeded_total`。
+- **集群花括号 key 快速失败**：无法安全映射 hash-tag 的业务 key 会在占位时抛
+  `IllegalArgumentException`；合法 tag 会复用，不再触发 CROSSSLOT。
+
 ## 真实场景注意事项
 
 以下限制与搭配约定来自真实部署中最常见的踩坑（部分由故障注入测试固化，见混沌测试套件）：
@@ -239,9 +315,10 @@ guard:
 - **与 `@Transactional` 的顺序**：两个切面均声明 `@Order(0)`，运行在事务拦截器（默认最低优先级）之外——
   占位获取在事务开始前、结果保存与占位释放/锁释放在事务提交之后。这保证"事务回滚后重放已保存结果"的
   窗口不存在；自定义切面如需与它们配合，请先确认优先级关系。
-- **Redis Cluster**：慢请求完成哨兵键采用 `{主键}:result` hash-tag 形式与主键同 slot，
-  多键 Lua 与 MGET 不会触发 CROSSSLOT；注意业务 key 自身含 `{}` 时，hash-tag 取第一个花括号组，
-  可能破坏同 slot 前提（业务键避免使用花括号）。
+- **Redis Cluster**：慢请求完成哨兵键采用 hash-tag 与主键同 slot，多键 Lua 与 MGET 不会触发 CROSSSLOT。
+  业务 key 无花括号时使用完整 key 作为 tag；已有合法非空 tag（如 `{tenant}:order:1`）时复用该 tag。
+  空 tag（`foo{}bar`）、不配对花括号（`foo{bar` / `foo}bar`）无法保证同 slot，会在占位时快速失败，
+  请移除花括号或使用合法 tag。
 - **网络故障行为**：Redis 断连/超时时按 `fail-open` 放行或 fail-close 拒绝（命令超时建议显式配置，
   如 `spring.data.redis.timeout=2s`，避免默认 60s 挂死请求线程）；重启后自动重连自愈。
   REPLAY 等待模式在查询故障时立即短路拒绝，不会以 50ms 间隔风暴式发布降级事件。

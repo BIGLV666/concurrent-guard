@@ -50,20 +50,61 @@ public class RedisSetNxIdempotentPolicy implements IdempotentPolicy {
     static final String PROCESSING_TOKEN_PREFIX = "__guard:processing__:";
 
     /**
-     * 慢请求完成哨兵键：{@code {主键}:result} 形式。
-     * 花括号 hash-tag 使哨兵键与主键在 Redis Cluster 下散列到同一 slot——
-     * 多键 Lua 脚本与 MGET 不再触发 CROSSSLOT 错误（单机 Redis 下花括号只是普通字符，无副作用）。
+     * 慢请求完成哨兵键：与主键在 Redis Cluster 下必须散列到同一 slot。
+     *
+     * <p>无花括号的主键：哨兵键为 {@code {主键}:result}，以完整主键作为 hash-tag，
+     * slot 与主键一致。主键本身带合法非空 hash-tag（如 {@code {tenant}:order:1}）时，
+     * 复用该 tag 生成 {@code {tenant}:result:{tenant}:order:1}，避免旧实现
+     * {@code {{tenant}:order:1}:result} 取到错误 tag 而触发 CROSSSLOT。</p>
+     *
+     * <p>空 tag（{@code foo{}bar}）、不配对花括号（{@code foo{bar} / foo}bar）无法保证
+     * 同 slot，直接快速失败并提示业务键移除花括号或使用合法 tag。</p>
+     *
+     * @throws IllegalArgumentException 主键包含无法安全映射的花括号
      */
     static String sentinelKeyOf(String key) {
-        return "{" + key + "}:result";
+        String tag = hashTagOf(key);
+        if (tag == null) {
+            return "{" + key + "}:result";
+        }
+        return "{" + tag + "}:result:" + key;
     }
 
     /**
-     * 哨兵键的 hash-tag 校验：哨兵键的花括号内即主键本身，
-     * 保证两者在 Redis Cluster 下散列到同一 slot（多键 Lua 与 MGET 的前提）。
+     * 提取 Redis Cluster 使用的 hash-tag；无花括号时返回 null。
+     */
+    private static String hashTagOf(String key) {
+        int open = key.indexOf('{');
+        int close = key.indexOf('}');
+        if (open < 0) {
+            if (close >= 0) {
+                throw invalidHashTag(key, "存在 '}' 但没有 '{'");
+            }
+            return null;
+        }
+        int tagEnd = key.indexOf('}', open + 1);
+        if (tagEnd < 0) {
+            throw invalidHashTag(key, "'{' 没有配对的 '}'");
+        }
+        if (tagEnd == open + 1) {
+            throw invalidHashTag(key, "hash-tag 不能为空");
+        }
+        return key.substring(open + 1, tagEnd);
+    }
+
+    private static IllegalArgumentException invalidHashTag(String key, String reason) {
+        return new IllegalArgumentException("业务 key 包含无法安全映射的 Redis Cluster 花括号（" + reason
+                + "）: " + key + "；请移除花括号，或使用非空且配对的形式（如 {tenant}:order:1）");
+    }
+
+    /**
+     * 判断哨兵键是否与主键同 slot（仅用于测试与诊断；实际 slot 由 Redis CRC16 计算）。
      */
     public static boolean isSameClusterSlot(String key) {
-        return ("{" + key + "}").equals(sentinelKeyOf(key).substring(0, key.length() + 2));
+        String tag = hashTagOf(key);
+        String sentinel = sentinelKeyOf(key);
+        String expected = tag == null ? "{" + key + "}" : "{" + tag + "}";
+        return sentinel.startsWith(expected + ":result");
     }
 
     /**
@@ -119,6 +160,8 @@ public class RedisSetNxIdempotentPolicy implements IdempotentPolicy {
      */
     @Override
     public String tryAcquireToken(String key, Duration ttl) {
+        // 提前校验花括号，避免 REPLAY 保存/读取阶段才暴露集群 slot 问题
+        sentinelKeyOf(key);
         String token = PROCESSING_TOKEN_PREFIX + UUID.randomUUID();
         Boolean ok = redisTemplate.opsForValue().setIfAbsent(key, token, ttl);
         return Boolean.TRUE.equals(ok) ? token : null;

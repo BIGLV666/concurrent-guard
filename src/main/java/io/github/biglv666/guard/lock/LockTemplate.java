@@ -1,13 +1,20 @@
 package io.github.biglv666.guard.lock;
 
 import io.github.biglv666.guard.GuardProperties;
+import io.github.biglv666.guard.event.GuardEventType;
+import io.github.biglv666.guard.event.GuardRejectedEvent;
+import io.github.biglv666.guard.internal.GuardEventSupport;
 import io.github.biglv666.guard.metrics.GuardMetrics;
-import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.ApplicationEventPublisher;
 
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -18,8 +25,11 @@ import java.util.function.Supplier;
  * {@link #withLocalLock(String, Supplier)} 使用当前 JVM 内的本地锁。
  * 两者都只保护 Lambda 执行期间的代码，适合细粒度锁定局部业务逻辑。</p>
  *
- * <p>Redis 客户端不会在模板实例化时校验，而是在首次调用 Redis 方法时懒获取。
- * 本地锁不依赖 Redisson，且本地锁的租期参数不适用。</p>
+ * <p>锁执行器按 {@link LockType} 选择：本地锁不依赖 Redisson，
+ * Redis 客户端仅在实际调用 Redis 路径时懒获取。</p>
+ *
+ * <p>超时与中断会发布 {@link GuardRejectedEvent} 并计入拒绝指标，
+ * 与 {@link LockAspect} 的声明式路径保持一致。</p>
  *
  * @author Guard Team
  * @since 0.1.0
@@ -33,33 +43,76 @@ public class LockTemplate {
      */
     private static final long DEFAULT_WAIT_SECONDS = 3;
 
-    private final ObjectProvider<RedissonClient> redissonProvider;
+    private final Map<LockType, LockExecutor> executors;
     private final GuardProperties.Lock properties;
-    private final LocalLockManager localLockManager;
     /** 可选：宿主无 Micrometer 时为 null，锁耗时上报为空操作。 */
     private final GuardMetrics metrics;
+    private final ApplicationEventPublisher eventPublisher;
 
-    /** 兼容旧版直接实例化方式。 */
-    public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
-                        GuardProperties.Lock properties) {
-        this(redissonProvider, properties, new LocalLockManager(), null);
+    /**
+     * 标准构造器：按 {@link LockType} 索引可用的锁执行器。
+     *
+     * @param executors      锁执行器列表（至少包含本地锁执行器）
+     * @param properties     锁模块配置
+     * @param metrics        指标上报器，允许为 null
+     * @param eventPublisher 事件发布器，允许为 null（直接实例化时）
+     * @since 0.2.1
+     */
+    public LockTemplate(List<LockExecutor> executors,
+                        GuardProperties.Lock properties,
+                        GuardMetrics metrics,
+                        ApplicationEventPublisher eventPublisher) {
+        this.executors = index(executors);
+        this.properties = properties;
+        this.metrics = metrics;
+        this.eventPublisher = eventPublisher;
     }
 
-    /** 兼容 0.1.0 直接实例化方式（无指标上报）。 */
+    /**
+     * 仅本地锁的便捷构造器：不依赖 Redisson，适合单实例或测试场景。
+     *
+     * @param localLockManager 本地锁管理器
+     * @param properties       锁模块配置
+     * @since 0.2.1
+     */
+    public LockTemplate(LocalLockManager localLockManager, GuardProperties.Lock properties) {
+        this(List.of(new LocalLockExecutor(localLockManager)), properties, null, null);
+    }
+
+    /**
+     * 兼容旧版直接实例化方式。
+     *
+     * @deprecated 请使用接收 {@link LockExecutor} 列表的构造器；旧构造器依赖 Redisson 类型。
+     */
+    @Deprecated
+    public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
+                        GuardProperties.Lock properties) {
+        this(legacyExecutors(redissonProvider, new LocalLockManager()), properties, null, null);
+    }
+
+    /**
+     * 兼容 0.1.0 直接实例化方式（无指标上报）。
+     *
+     * @deprecated 请使用接收 {@link LockExecutor} 列表的构造器；旧构造器依赖 Redisson 类型。
+     */
+    @Deprecated
     public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                         GuardProperties.Lock properties,
                         LocalLockManager localLockManager) {
-        this(redissonProvider, properties, localLockManager, null);
+        this(legacyExecutors(redissonProvider, localLockManager), properties, null, null);
     }
 
+    /**
+     * 兼容旧版直接实例化方式。
+     *
+     * @deprecated 请使用接收 {@link LockExecutor} 列表的构造器；旧构造器依赖 Redisson 类型。
+     */
+    @Deprecated
     public LockTemplate(ObjectProvider<RedissonClient> redissonProvider,
                         GuardProperties.Lock properties,
                         LocalLockManager localLockManager,
                         GuardMetrics metrics) {
-        this.redissonProvider = redissonProvider;
-        this.properties = properties;
-        this.localLockManager = localLockManager;
-        this.metrics = metrics;
+        this(legacyExecutors(redissonProvider, localLockManager), properties, metrics, null);
     }
 
     /**
@@ -101,22 +154,7 @@ public class LockTemplate {
 
     /** 使用指定等待时间的 JVM 本地锁保护代码块；本地锁不使用 leaseTime。 */
     public <T> T withLocalLock(String key, long waitTime, TimeUnit unit, Supplier<T> action) {
-        String fullKey = properties.getKeyPrefix() + key;
-        LocalLockManager.Handle handle = localLockManager.acquire(fullKey);
-        boolean locked = false;
-        long acquireStart = System.nanoTime();
-        try {
-            locked = handle.lock().tryLock(waitTime, unit);
-            if (!locked) throw timeout(fullKey, waitTime, unit);
-            recordAcquire(LockType.SYNCHRONIZED, acquireStart);
-            return action.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new LockAcquireInterruptedException(fullKey, "锁等待被中断: " + fullKey);
-        } finally {
-            if (locked) handle.lock().unlock();
-            handle.close();
-        }
+        return execute(LockType.SYNCHRONIZED, key, waitTime, -1, unit, action);
     }
 
     /**
@@ -132,59 +170,125 @@ public class LockTemplate {
      * @throws LockAcquireTimeoutException 等待超时未获取到锁
      */
     public <T> T withLock(String key, long waitTime, long leaseTime, TimeUnit unit, Supplier<T> action) {
-        String fullKey = String.format("%s%s", properties.getKeyPrefix(), key);
-        RLock lock = requireClient().getLock(fullKey);
-        boolean locked = false;
-        long acquireStart = System.nanoTime();
+        return execute(LockType.REDIS, key, waitTime, leaseTime, unit, action);
+    }
+
+    /**
+     * 按锁类型执行加锁逻辑，并统一处理超时/中断上报与锁释放。
+     */
+    private <T> T execute(LockType lockType, String key, long waitTime, long leaseTime,
+                          TimeUnit unit, Supplier<T> action) {
+        String fullKey = properties.getKeyPrefix() + key;
+        LockExecutor executor = executor(lockType);
+        LockHandle handle;
         try {
-            locked = lock.tryLock(waitTime, leaseTime, unit);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.warn("LockTemplate 锁等待被中断 - key: {}", fullKey);
-            throw new LockAcquireInterruptedException(fullKey, "锁等待被中断: " + fullKey);
+            handle = executor.acquire(fullKey, waitTime, leaseTime, unit);
+        } catch (LockAcquireInterruptedException e) {
+            reject(fullKey, lockType, "锁等待被中断");
+            throw e;
+        } catch (LockAcquireTimeoutException e) {
+            reject(fullKey, lockType, "锁等待超时");
+            throw e;
+        } catch (LockConfigurationException e) {
+            // 配置错误不受 fail-open 影响
+            throw e;
+        } catch (RuntimeException e) {
+            return handleAcquireFailure(lockType, fullKey, action, e);
         }
-        if (!locked) {
-            throw timeout(fullKey, waitTime, unit);
-        }
-        recordAcquire(LockType.REDIS, acquireStart);
+        recordAcquire(lockType, handle.acquireNanos());
         try {
             return action.get();
         } finally {
             try {
-                if (lock.isHeldByCurrentThread()) {
-                    lock.unlock();
-                }
-            } catch (IllegalMonitorStateException e) {
-                log.warn("锁释放异常（租期可能已过期被自动释放）- key: {}", fullKey, e);
+                handle.close();
+            } catch (RuntimeException e) {
+                // 释放异常不应覆盖业务异常或业务返回值
+                log.warn("锁释放异常 - key: {}", fullKey, e);
             }
         }
+    }
+
+    private LockExecutor executor(LockType lockType) {
+        LockExecutor executor = executors.get(lockType);
+        if (executor == null) {
+            throw new LockConfigurationException("未装配锁执行器: " + lockType
+                    + " - 请检查 guard.lock.enabled 与 Redisson 依赖；本地锁请使用 withLocalLock");
+        }
+        return executor;
+    }
+
+    /**
+     * 锁基础设施故障处理：按 {@code guard.lock.fail-open} 放行或拒绝。
+     */
+    private <T> T handleAcquireFailure(LockType lockType, String fullKey,
+                                       Supplier<T> action, RuntimeException cause) {
+        if (properties.isFailOpen()) {
+            log.warn("锁基础设施故障，fail-open 跳过加锁（本次不做互斥保护） - key: {}, 错误: {}",
+                    fullKey, cause.getMessage());
+            if (metrics != null) {
+                metrics.incrementDegraded(GuardEventType.LOCK_DEGRADED.name());
+            }
+            publish(GuardEventType.LOCK_DEGRADED, fullKey, lockType,
+                    "锁基础设施故障，fail-open: " + cause.getMessage());
+            return action.get();
+        }
+        log.warn("锁基础设施故障，fail-close 拒绝 - key: {}, 错误: {}", fullKey, cause.getMessage());
+        if (metrics != null) {
+            metrics.incrementRejected(GuardEventType.LOCK_DEGRADED.name());
+            metrics.incrementDegraded(GuardEventType.LOCK_DEGRADED.name());
+        }
+        publish(GuardEventType.LOCK_DEGRADED, fullKey, lockType,
+                "锁基础设施故障，fail-close: " + cause.getMessage());
+        throw new LockAcquireFailureException(fullKey, "获取锁失败（基础设施故障）: " + fullKey, cause);
     }
 
     /**
      * 上报一次成功获取锁的耗时（含等待时间）；超时失败不计入耗时分布。
      */
-    private void recordAcquire(LockType lockType, long acquireStart) {
+    private void recordAcquire(LockType lockType, long acquireNanos) {
         if (metrics != null) {
-            metrics.recordLockAcquire(lockType.name(), System.nanoTime() - acquireStart);
+            metrics.recordLockAcquire(lockType.name(), acquireNanos);
         }
     }
 
     /**
-     * 构造锁等待超时异常，消息用占位符格式化。
+     * 发布拒绝事件并累加拒绝指标，与声明式切面保持一致。
      */
-    private static LockAcquireTimeoutException timeout(String fullKey, long waitTime, TimeUnit unit) {
-        String message = String.format("获取锁超时: %s（等待 %d %s）", fullKey, waitTime, unit);
-        return new LockAcquireTimeoutException(fullKey, message);
+    private void reject(String fullKey, LockType lockType, String reason) {
+        if (metrics != null) {
+            metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
+        }
+        publish(GuardEventType.LOCK_TIMEOUT, fullKey, lockType, reason);
     }
 
-    private RedissonClient requireClient() {
-        RedissonClient client = redissonProvider.getIfAvailable();
-        if (client == null) {
-            throw new IllegalStateException(
-                    "LockTemplate 需要容器中存在 RedissonClient Bean。"
-                            + "请引入 redisson 依赖并注册 RedissonClient（或使用 redisson-spring-boot-starter）；"
-                            + "若暂不使用分布式锁，可配置 guard.lock.enabled=false。");
+    private void publish(GuardEventType type, String fullKey, LockType lockType, String reason) {
+        GuardEventSupport.publish(eventPublisher, new GuardRejectedEvent(
+                type, fullKey, "LockTemplate#" + lockType.name(), reason));
+    }
+
+    private static Map<LockType, LockExecutor> index(List<LockExecutor> executors) {
+        Map<LockType, LockExecutor> indexed = new EnumMap<>(LockType.class);
+        if (executors != null) {
+            for (LockExecutor executor : executors) {
+                if (executor != null && executor.type() != null) {
+                    indexed.put(executor.type(), executor);
+                }
+            }
         }
-        return client;
+        return indexed;
+    }
+
+    /**
+     * 旧构造器兼容：本地锁始终存在；仅当传入 Redisson 客户端提供者时才创建 Redis 执行器。
+     * 该分支在 classpath 无 Redisson 时不会被触发，因此本地锁仍可独立使用。
+     */
+    private static List<LockExecutor> legacyExecutors(ObjectProvider<RedissonClient> redissonProvider,
+                                                      LocalLockManager localLockManager) {
+        List<LockExecutor> executors = new ArrayList<>();
+        executors.add(new LocalLockExecutor(localLockManager != null ? localLockManager : new LocalLockManager()));
+        if (redissonProvider != null) {
+            executors.add(new RedissonLockExecutor(redissonProvider));
+        }
+        return executors;
     }
 }

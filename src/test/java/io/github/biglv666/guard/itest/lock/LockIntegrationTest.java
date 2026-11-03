@@ -1,5 +1,7 @@
 package io.github.biglv666.guard.itest.lock;
 
+import io.github.biglv666.guard.idempotent.Idempotent;
+import io.github.biglv666.guard.idempotent.IdempotentRejectedException;
 import io.github.biglv666.guard.lock.DistributedLock;
 import io.github.biglv666.guard.lock.LockAcquireFallbackHandler;
 import io.github.biglv666.guard.lock.LockAcquireInterruptedException;
@@ -46,7 +48,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * @since 0.1.0
  */
 @Testcontainers
-@SpringBootTest(classes = LockIntegrationTest.App.class)
+// 本测试只给 Redisson 配置了容器地址；幂等侧使用本地策略，避免误连 localhost:6379
+@SpringBootTest(classes = LockIntegrationTest.App.class,
+        properties = "guard.idempotent.store=local")
 class LockIntegrationTest {
 
     @Container
@@ -103,6 +107,29 @@ class LockIntegrationTest {
     void localAnnotatedLockWorks() {
         String key = "local-method-" + UUID.randomUUID();
         assertEquals("local:" + key, service.local(key, 1));
+    }
+
+    @Test
+    void idempotentRejectsBeforeWaitingForLock() throws Exception {
+        String key = "both-" + UUID.randomUUID();
+        java.util.concurrent.atomic.AtomicReference<Throwable> holderError =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        Thread holder = new Thread(() -> {
+            try {
+                service.both(key);
+            } catch (Throwable t) {
+                holderError.set(t);
+            }
+        });
+        holder.start();
+        // 留出足够时间让首次请求完成幂等占位与加锁
+        Thread.sleep(500);
+
+        // 幂等切面 @Order(0) 在锁切面 @Order(100) 之外：
+        // 重复请求应立即被幂等拒绝，而不是先等待锁再超时
+        assertThrows(IdempotentRejectedException.class, () -> service.both(key));
+        holder.join(5000);
+        assertNull(holderError.get(), "首次请求不应异常: " + holderError.get());
     }
 
     @Test
@@ -266,6 +293,17 @@ class LockIntegrationTest {
             @DistributedLock(key = "#k")
             public String failing(String k) {
                 throw new IllegalStateException("boom");
+            }
+
+            @Idempotent(key = "#k", ttl = 10)
+            @DistributedLock(key = "#k", waitTime = 100, timeUnit = TimeUnit.MILLISECONDS)
+            public String both(String k) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return "both:" + k;
             }
         }
 

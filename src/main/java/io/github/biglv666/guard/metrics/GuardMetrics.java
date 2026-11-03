@@ -55,6 +55,16 @@ public class GuardMetrics {
      */
     public static final String LOCK_ACQUIRE_TIMER = "guard_lock_acquire";
 
+    /**
+     * 计数器名称：业务方法耗时超过幂等 TTL 的次数。
+     *
+     * <p>TTL 小于业务最大耗时时，占位会在业务完成前过期，窗口内可能重新进入业务；
+     * 该指标用于让这类配置问题可观测。</p>
+     *
+     * @since 0.2.2
+     */
+    public static final String TTL_EXCEEDED_COUNTER = "guard_idempotent_ttl_exceeded_total";
+
     private final MeterRegistry registry;
 
     public GuardMetrics(ObjectProvider<MeterRegistry> registryProvider) {
@@ -97,6 +107,19 @@ public class GuardMetrics {
             return;
         }
         registry.counter(DEGRADED_COUNTER, "type", type).increment();
+    }
+
+    /**
+     * 累加一次"业务耗时超过幂等 TTL"计数。
+     *
+     * @param type 事件类型，作为指标 tag「type」的值
+     * @since 0.2.2
+     */
+    public void incrementTtlExceeded(String type) {
+        if (registry == null) {
+            return;
+        }
+        registry.counter(TTL_EXCEEDED_COUNTER, "type", type).increment();
     }
 
     /**

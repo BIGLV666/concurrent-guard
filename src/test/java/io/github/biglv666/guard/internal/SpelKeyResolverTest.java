@@ -26,7 +26,24 @@ class SpelKeyResolverTest {
         }
 
         @SuppressWarnings("unused")
+        public String orderObject(Order order) {
+            return order.getId();
+        }
+
+        @SuppressWarnings("unused")
         public void nothing() {
+        }
+    }
+
+    static class Order {
+        private final String id;
+
+        Order(String id) {
+            this.id = id;
+        }
+
+        public String getId() {
+            return id;
         }
     }
 
@@ -44,6 +61,19 @@ class SpelKeyResolverTest {
     void resolvesTemplateExpression() throws NoSuchMethodException {
         String key = resolver.resolve(method("order", String.class), new Object[]{"42"}, "order:#{#orderId}");
         assertEquals("order:42", key);
+    }
+
+    @Test
+    void resolvesPositionalAliases() throws NoSuchMethodException {
+        java.lang.reflect.Method method = method("order", String.class);
+        assertEquals("42", resolver.resolve(method, new Object[]{"42"}, "#p0"));
+        assertEquals("42", resolver.resolve(method, new Object[]{"42"}, "#a0"));
+    }
+
+    @Test
+    void resolvesInstanceMethods() throws NoSuchMethodException {
+        java.lang.reflect.Method method = method("orderObject", Order.class);
+        assertEquals("42", resolver.resolve(method, new Object[]{new Order("42")}, "#order.getId()"));
     }
 
     @Test
