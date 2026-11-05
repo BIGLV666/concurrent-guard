@@ -50,9 +50,9 @@ class RedisClusterCrossSlotChaosTest {
      * Windows/macOS 的 NAT 限制由此绕开。
      */
     private static final String STARTUP_SCRIPT = """
-            redis-server --port 7100 --cluster-enabled yes --cluster-config-file /tmp/nodes-7100.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7100 --cluster-announce-bus-port 17100 --save '' &
-            redis-server --port 7101 --cluster-enabled yes --cluster-config-file /tmp/nodes-7101.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7101 --cluster-announce-bus-port 17101 --save '' &
-            redis-server --port 7102 --cluster-enabled yes --cluster-config-file /tmp/nodes-7102.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7102 --cluster-announce-bus-port 17102 --save '' &
+            redis-server --bind 0.0.0.0 --protected-mode no --port 7100 --cluster-enabled yes --cluster-config-file /tmp/nodes-7100.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7100 --cluster-announce-bus-port 17100 --save '' &
+            redis-server --bind 0.0.0.0 --protected-mode no --port 7101 --cluster-enabled yes --cluster-config-file /tmp/nodes-7101.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7101 --cluster-announce-bus-port 17101 --save '' &
+            redis-server --bind 0.0.0.0 --protected-mode no --port 7102 --cluster-enabled yes --cluster-config-file /tmp/nodes-7102.conf --cluster-node-timeout 2000 --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7102 --cluster-announce-bus-port 17102 --save '' &
             sleep 1
             for i in $(seq 1 60); do
               redis-cli --cluster create 127.0.0.1:7100 127.0.0.1:7101 127.0.0.1:7102 --cluster-yes > /tmp/create.log 2>&1
