@@ -436,3 +436,6 @@ guard:
 ./mvnw clean verify        # 全量测试（需本机 Docker，Testcontainers 起 Redis）
 ./mvnw clean install
 ```
+
+运行 CI 或发布前请先阅读 [CI_PITFALLS.md](CI_PITFALLS.md)；
+项目内提供了 `ci-preflight` skill，会在 CI 相关操作前提醒执行检查清单。
