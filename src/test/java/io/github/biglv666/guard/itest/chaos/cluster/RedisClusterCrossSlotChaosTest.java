@@ -65,18 +65,28 @@ class RedisClusterCrossSlotChaosTest {
 
     @Container
     @SuppressWarnings("resource")
-    static final GenericContainer<?> CLUSTER = new GenericContainer<>(
-            DockerImageName.parse("redis:7-alpine"))
-            .withCommand("sh", "-c", STARTUP_SCRIPT)
-            .waitingFor(Wait.forLogMessage(".*CLUSTER_OK.*", 1))
-            .withCreateContainerCmdModifier(cmd -> {
-                var ports = new com.github.dockerjava.api.model.Ports();
-                for (int p : new int[]{P1, P2, P3, 17100, 17101, 17102}) {
-                    ports.bind(new com.github.dockerjava.api.model.ExposedPort(p),
-                            com.github.dockerjava.api.model.Ports.Binding.bindPort(p));
-                }
-                cmd.getHostConfig().withPortBindings(ports);
-            });
+    static final GenericContainer<?> CLUSTER = createCluster();
+
+    private static GenericContainer<?> createCluster() {
+        GenericContainer<?> container = new GenericContainer<>(DockerImageName.parse("redis:7-alpine"))
+                .withCommand("sh", "-c", STARTUP_SCRIPT)
+                .waitingFor(Wait.forLogMessage(".*CLUSTER_OK.*", 1));
+        // Linux CI 使用 host 网络，避免固定端口在部分 Docker 环境下无法从宿主访问；
+        // Docker Desktop（macOS/Windows）不支持 host 网络，保留固定端口绑定方案。
+        if (System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+            return container.withNetworkMode("host");
+        }
+        return container
+                .withExposedPorts(P1, P2, P3, 17100, 17101, 17102)
+                .withCreateContainerCmdModifier(cmd -> {
+                    var ports = new com.github.dockerjava.api.model.Ports();
+                    for (int p : new int[]{P1, P2, P3, 17100, 17101, 17102}) {
+                        ports.bind(new com.github.dockerjava.api.model.ExposedPort(p),
+                                com.github.dockerjava.api.model.Ports.Binding.bindPort(p));
+                    }
+                    cmd.getHostConfig().withPortBindings(ports);
+                });
+    }
 
     /**
      * 直接用原始键列表执行与 {@link RedisSetNxIdempotentPolicy} 同款的结果保存脚本。
