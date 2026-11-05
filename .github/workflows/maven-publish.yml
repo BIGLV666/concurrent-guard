@@ -44,8 +44,11 @@ jobs:
         run: ./mvnw -B clean verify
 
       - name: Publish signed artifacts
+        # 使用 wrapper 固定 Maven 3.9.16：runner 的系统 Maven 3.10 会让
+        # central-publishing-maven-plugin 把 maven-metadata-local.xml 打进 bundle，
+        # 导致 Central 校验报 "Bundle has content that does NOT have a .pom file"。
         run: |
-          mvn -B deploy -Prelease \
+          ./mvnw -B deploy -Prelease \
             -DskipTests \
             -Dgpg.passphrase="$GPG_PASSPHRASE" \
             --no-transfer-progress
