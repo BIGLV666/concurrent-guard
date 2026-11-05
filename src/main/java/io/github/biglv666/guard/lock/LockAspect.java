@@ -162,6 +162,9 @@ public class LockAspect {
                 // 中断意味着调用方取消/线程关闭，与锁竞争超时语义不同：
                 // 无论获取失败策略如何，都以中断异常终止（中断标记已由执行器恢复）
                 throw e;
+            } catch (LockAcquireFailureException e) {
+                // 基础设施故障必须走 fail-open/fail-close，不能按竞争超时处理
+                return handleAcquireFailure(pjp, key, method, e);
             } catch (LockAcquireTimeoutException e) {
                 metrics.incrementRejected(GuardEventType.LOCK_TIMEOUT.name());
                 publish(key, method, "锁等待超时");

@@ -34,15 +34,26 @@ public class GuardHealthIndicator implements HealthIndicator {
     @Override
     public Health health() {
         IdempotentPolicy policy = policyProvider.getIfAvailable();
-        List<String> lockExecutors = executorProvider.orderedStream()
+        List<LockExecutor> executors = executorProvider.orderedStream().toList();
+        List<String> lockExecutors = executors.stream()
+                .map(executor -> executor.type().name())
+                .toList();
+        List<String> unavailableLockExecutors = executors.stream()
+                .filter(executor -> !executor.isAvailable())
                 .map(executor -> executor.type().name())
                 .toList();
 
-        return Health.up()
+        boolean idempotentMissing = properties.getIdempotent().isEnabled() && policy == null;
+        boolean lockMissing = properties.getLock().isEnabled() && executors.isEmpty();
+        Health.Builder builder = idempotentMissing || lockMissing ? Health.down() : Health.up();
+
+        return builder
                 .withDetail("idempotentStore", properties.getIdempotent().getStore())
                 .withDetail("idempotentPolicy", policy != null ? policy.getClass().getName() : "none")
+                .withDetail("idempotentPolicyPresent", policy != null)
                 .withDetail("idempotentFailOpen", properties.getIdempotent().isFailOpen())
                 .withDetail("lockExecutors", lockExecutors)
+                .withDetail("unavailableLockExecutors", unavailableLockExecutors)
                 .withDetail("lockFailOpen", properties.getLock().isFailOpen())
                 .build();
     }

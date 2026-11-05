@@ -27,6 +27,16 @@ public interface LockExecutor {
     LockType type();
 
     /**
+     * 执行器当前是否可用。默认 true；需要外部客户端的实现（如 Redisson）可覆写，
+     * 用于健康检查展示，不应在方法中做耗时探测。
+     *
+     * @since 0.3.0
+     */
+    default boolean isAvailable() {
+        return true;
+    }
+
+    /**
      * 获取锁。
      *
      * @param key       完整锁键（含配置前缀）

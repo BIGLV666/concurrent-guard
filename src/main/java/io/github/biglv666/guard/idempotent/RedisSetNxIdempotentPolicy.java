@@ -92,8 +92,8 @@ public class RedisSetNxIdempotentPolicy implements IdempotentPolicy {
         return key.substring(open + 1, tagEnd);
     }
 
-    private static IllegalArgumentException invalidHashTag(String key, String reason) {
-        return new IllegalArgumentException("业务 key 包含无法安全映射的 Redis Cluster 花括号（" + reason
+    private static IdempotentKeyException invalidHashTag(String key, String reason) {
+        return new IdempotentKeyException("业务 key 包含无法安全映射的 Redis Cluster 花括号（" + reason
                 + "）: " + key + "；请移除花括号，或使用非空且配对的形式（如 {tenant}:order:1）");
     }
 

@@ -56,6 +56,21 @@ class LockTemplateFailureTest {
     }
 
     @Test
+    void explicitInfrastructureExceptionIsHandledAsDegraded() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        List<GuardRejectedEvent> events = new ArrayList<>();
+        LockAcquireFailureException failure = new LockAcquireFailureException(
+                "guard:lock:k", "redis down", new IllegalStateException("connection refused"));
+        LockTemplate template = template(new FailingExecutor(failure), false, registry, events);
+
+        assertThrows(LockAcquireFailureException.class,
+                () -> template.withLocalLock("k", () -> "v"));
+        assertEquals(GuardEventType.LOCK_DEGRADED, events.get(0).getType());
+        assertEquals(1.0, registry.get(GuardMetrics.REJECTED_COUNTER)
+                .tag("type", GuardEventType.LOCK_DEGRADED.name()).counter().count());
+    }
+
+    @Test
     void configurationErrorIsNotAffectedByFailOpen() {
         LockTemplate template = template(new FailingExecutor(new LockConfigurationException("no client")),
                 true, new SimpleMeterRegistry(), new ArrayList<>());

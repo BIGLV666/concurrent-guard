@@ -425,17 +425,9 @@ public class SpelKeyResolver {
                 || Optional.class.isAssignableFrom(ownerClass)) {
             return null;
         }
-        for (Class<?> current = ownerClass; current != null && current != Object.class;
-             current = current.getSuperclass()) {
-            try {
-                Field field = current.getDeclaredField(name);
-                if (!Modifier.isStatic(field.getModifiers())) {
-                    return new PropertyLookup(ResolvableType.forField(field, owner), field.getName());
-                }
-            } catch (NoSuchFieldException ignored) {
-                // 继续查找 getter
-            }
-        }
+        // 按 SpEL 的实际访问顺序：public getter → record accessor → public field。
+        // 不能接受 private/protected 字段：SimpleEvaluationContext 的
+        // ReflectivePropertyAccessor 只通过 public 字段或 getter 读取属性。
         String suffix = Character.toUpperCase(name.charAt(0)) + name.substring(1);
         for (String prefix : List.of("get", "is")) {
             try {
@@ -458,6 +450,14 @@ public class SpelKeyResolver {
             } catch (NoSuchMethodException ignored) {
                 // record 没有该 accessor
             }
+        }
+        try {
+            Field field = ownerClass.getField(name);
+            if (!Modifier.isStatic(field.getModifiers())) {
+                return new PropertyLookup(ResolvableType.forField(field, owner), field.getName());
+            }
+        } catch (NoSuchFieldException ignored) {
+            // 没有 public 字段
         }
         return null;
     }

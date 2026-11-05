@@ -34,6 +34,11 @@ public class RedissonLockExecutor implements LockExecutor {
     }
 
     @Override
+    public boolean isAvailable() {
+        return redissonProvider != null && redissonProvider.getIfAvailable() != null;
+    }
+
+    @Override
     public LockHandle acquire(String key, long waitTime, long leaseTime, TimeUnit unit) {
         RLock lock = requireClient().getLock(key);
         long start = System.nanoTime();

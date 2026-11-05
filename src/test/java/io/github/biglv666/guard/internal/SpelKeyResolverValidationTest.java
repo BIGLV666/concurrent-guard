@@ -62,6 +62,19 @@ class SpelKeyResolverValidationTest {
     }
 
     @Test
+    void privateFieldWithoutGetterIsReported() throws Exception {
+        Method method = Service.class.getMethod("submitPrivate", PrivateOrder.class);
+        SpelKeyResolver.ValidationResult warn = resolver.validate(method, "#order.id",
+                SpelKeyResolver.PropertyCheckMode.WARN);
+        assertFalse(warn.hasErrors());
+        assertTrue(warn.warnings().get(0).contains("id"), warn.warnings().toString());
+
+        SpelKeyResolver.ValidationResult strict = resolver.validate(method, "#order.id",
+                SpelKeyResolver.PropertyCheckMode.STRICT);
+        assertTrue(strict.hasErrors(), "private 字段无 getter 在 strict 下应报错");
+    }
+
+    @Test
     void recordAccessorIsAccepted() throws Exception {
         Method method = Service.class.getMethod("submitRecord", OrderRecord.class);
         SpelKeyResolver.ValidationResult result = resolver.validate(method, "#order.id");
@@ -111,6 +124,14 @@ class SpelKeyResolverValidationTest {
     record OrderRecord(String id) {
     }
 
+    static class PrivateOrder {
+        private final String id;
+
+        PrivateOrder(String id) {
+            this.id = id;
+        }
+    }
+
     static class Service {
         @SuppressWarnings("unused")
         public String submit(Order order, String orderId) {
@@ -120,6 +141,11 @@ class SpelKeyResolverValidationTest {
         @SuppressWarnings("unused")
         public String submitRecord(OrderRecord order) {
             return order.id();
+        }
+
+        @SuppressWarnings("unused")
+        public String submitPrivate(PrivateOrder order) {
+            return "private";
         }
     }
 }

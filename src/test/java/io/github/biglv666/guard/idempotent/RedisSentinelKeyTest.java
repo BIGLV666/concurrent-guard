@@ -30,11 +30,11 @@ class RedisSentinelKeyTest {
 
     @Test
     void invalidBracesFailFast() {
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(IdempotentKeyException.class,
                 () -> RedisSetNxIdempotentPolicy.sentinelKeyOf("foo{}bar"));
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(IdempotentKeyException.class,
                 () -> RedisSetNxIdempotentPolicy.sentinelKeyOf("foo{bar"));
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(IdempotentKeyException.class,
                 () -> RedisSetNxIdempotentPolicy.sentinelKeyOf("foo}bar"));
     }
 }

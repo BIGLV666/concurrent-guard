@@ -190,7 +190,8 @@ guard:
 - 变量名拼写错误（错误信息会列出可用变量）；
 - `#p0` / `#a0` 位置变量越界；
 - `T(...)` 类型引用、`new ...` 构造器（`SimpleEvaluationContext` 安全限制）；
-- 属性/方法名拼写（`warn` 只告警，`strict` 视为错误）；
+- 属性/方法名拼写（`warn` 只告警，`strict` 视为错误）；属性检查遵循 SpEL 实际访问规则，
+  只认 public getter 与 public 字段，private 字段没有 getter 会被提示（strict 下视为错误）；
 - `ttl <= 0`、`waitMillis` 用于 REJECT、`CUSTOM` 未指定 handler、
   `SKIP` 用于基本类型返回值等注解属性组合问题。
 
@@ -261,8 +262,10 @@ public void onGuardRejected(GuardRejectedEvent event) {
     "details": {
       "idempotentStore": "redis",
       "idempotentPolicy": "io.github.biglv666.guard.idempotent.RedisSetNxIdempotentPolicy",
+      "idempotentPolicyPresent": true,
       "idempotentFailOpen": true,
       "lockExecutors": ["SYNCHRONIZED", "REDIS"],
+      "unavailableLockExecutors": [],
       "lockFailOpen": false
     }
   }
@@ -347,6 +350,7 @@ guard:
 | `LockTemplate` 锁超时/中断 | 与注解切面一致：发布 `GuardRejectedEvent` 并计入 `guard_rejected_total` |
 | Redis 锁基础设施故障 | 按 `guard.lock.fail-open`：false（默认）拒绝并抛 `LockAcquireFailureException`；true 跳过加锁放行，发布 `LOCK_DEGRADED` 并计降级指标 |
 | 幂等业务耗时超过 TTL | 记录 warn 并累加 `guard_idempotent_ttl_exceeded_total`；建议增大 TTL 或检查慢业务 |
+| Redis key 含非法花括号 | 抛 `IdempotentKeyException`，属于数据/配置错误，**不受 fail-open 影响** |
 | 重载方法未显式写 key | 0.3.0 默认键包含参数类型，不再互撞；`guard.compat.legacy-default-key=true` 可回退旧格式 |
 | `@Idempotent(condition=false)` | 跳过幂等防护，直接执行业务，不占位 |
 | `@Idempotent(unless=true)` | 业务成功后释放占位且不保存 REPLAY 结果，允许后续请求重试 |
@@ -383,6 +387,9 @@ guard:
 - **新增 LockTemplate API**：`tryWithLock`、`callWithLock`、超时回退重载，以及对应的本地锁版本。
 - **新增健康检查/指标**：actuator 存在时注册 `GuardHealthIndicator`；新增 `guard_lock_hold`。
 - **condition / unless**：新增幂等前置条件与后置排除表达式，`unless` 可用 `#result`。
+- **属性校验更贴近 SpEL**：只认 public getter / public 字段；private 字段没有 getter 会被提示。
+- **健康检查更严格**：幂等启用但无策略 Bean、或锁启用但无执行器时返回 DOWN；
+  Redis 执行器缺少客户端时会在 `unavailableLockExecutors` 中展示。
 
 ## 从 0.2.1 升级
 
@@ -398,7 +405,8 @@ guard:
 - **新增 TTL 超时观测**：业务耗时超过幂等 TTL 时记录 warn 并累加
   `guard_idempotent_ttl_exceeded_total`。
 - **集群花括号 key 快速失败**：无法安全映射 hash-tag 的业务 key 会在占位时抛
-  `IllegalArgumentException`；合法 tag 会复用，不再触发 CROSSSLOT。
+  `IdempotentKeyException`（`IllegalArgumentException` 子类），且不受 `fail-open` 影响；
+  合法 tag 会复用，不再触发 CROSSSLOT。
 
 ## 真实场景注意事项
 
@@ -407,8 +415,9 @@ guard:
 - **自调用绕过（最高频误用）**：同一个 Bean 内部调用（`this.method()`）不经过 Spring AOP 代理，
   `@Idempotent` / `@DistributedLock` 会**静默失效**。需要防护的方法必须通过代理调用（注入自身代理、
   拆分到另一个 Bean、或使用 `AopContext.currentProxy()`）。
-- **与 `@Transactional` 的顺序**：两个切面均声明 `@Order(0)`，运行在事务拦截器（默认最低优先级）之外——
-  占位获取在事务开始前、结果保存与占位释放/锁释放在事务提交之后。这保证"事务回滚后重放已保存结果"的
+- **与 `@Transactional` 的顺序**：`IdempotentAspect` 为 `@Order(0)`、`LockAspect` 为 `@Order(100)`，
+  两者都运行在事务拦截器（默认最低优先级）之外——占位/加锁在事务开始前、结果保存与占位释放/锁释放在
+  事务提交之后。同一方法同时使用两种注解时，幂等判定先于锁竞争。这保证"事务回滚后重放已保存结果"的
   窗口不存在；自定义切面如需与它们配合，请先确认优先级关系。
 - **Redis Cluster**：慢请求完成哨兵键采用 hash-tag 与主键同 slot，多键 Lua 与 MGET 不会触发 CROSSSLOT。
   业务 key 无花括号时使用完整 key 作为 tag；已有合法非空 tag（如 `{tenant}:order:1`）时复用该 tag。

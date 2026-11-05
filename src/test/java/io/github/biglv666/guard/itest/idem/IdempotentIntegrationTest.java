@@ -3,6 +3,7 @@ package io.github.biglv666.guard.itest.idem;
 import io.github.biglv666.guard.event.GuardEventType;
 import io.github.biglv666.guard.event.GuardRejectedEvent;
 import io.github.biglv666.guard.idempotent.Idempotent;
+import io.github.biglv666.guard.idempotent.IdempotentKeyException;
 import io.github.biglv666.guard.idempotent.IdempotentRejectedException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -87,6 +89,15 @@ class IdempotentIntegrationTest {
 
         Thread.sleep(450);
         assertEquals("ok:" + key, service.fastTtl(key));
+    }
+
+    @Test
+    void invalidClusterHashTagKeyFailsFastEvenWithFailOpen() {
+        String key = "bad-{}" + UUID.randomUUID();
+        // 默认 fail-open=true，但 key 格式错误属于数据/配置错误，必须直接失败
+        assertThrows(IdempotentKeyException.class, () -> service.submit(key));
+        assertFalse(Boolean.TRUE.equals(redisTemplate.hasKey("guard:idempotent:" + key)),
+                "非法 key 不应写入 Redis 占位");
     }
 
     @Test

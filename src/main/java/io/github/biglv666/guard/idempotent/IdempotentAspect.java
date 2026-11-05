@@ -136,6 +136,9 @@ public class IdempotentAspect {
         String token;
         try {
             token = policy.tryAcquireToken(key, ttl);
+        } catch (IdempotentKeyException e) {
+            // key 格式/数据错误不是基础设施故障，不能被 fail-open 吞掉
+            throw e;
         } catch (Exception e) {
             // 策略实现自身故障：统一降级，不把基础设施故障直接抛给业务
             if (!degradeOnPolicyFailure(key, method, e)) {

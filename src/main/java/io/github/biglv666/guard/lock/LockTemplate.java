@@ -319,6 +319,9 @@ public class LockTemplate {
         } catch (LockAcquireInterruptedException e) {
             reject(fullKey, lockType, "锁等待被中断");
             throw e;
+        } catch (LockAcquireFailureException e) {
+            // 基础设施故障必须走 fail-open/fail-close，不能按竞争超时处理
+            return handleAcquireFailure(lockType, fullKey, action, e);
         } catch (LockAcquireTimeoutException e) {
             reject(fullKey, lockType, "锁等待超时");
             throw e;
